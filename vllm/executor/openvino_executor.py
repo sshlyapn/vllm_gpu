@@ -1,18 +1,235 @@
-import importlib
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Set
+import torch.distributed
 
 from vllm.lora.request import LoRARequest
-from vllm.worker.worker import Worker as OpenVINOWorker
 from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
                          ParallelConfig, SchedulerConfig, LoRAConfig)
 from vllm.executor.executor_base import ExecutorAsyncBase, ExecutorBase
 from vllm.executor.utils import check_block_size_valid
 from vllm.logger import init_logger
 from vllm.sequence import SamplerOutput, SequenceGroupMetadata
+from vllm.worker.cache_engine import CacheEngine
+from vllm.worker.model_runner import ModelRunner
+from vllm.lora.request import LoRARequest
+from vllm.model_executor import set_random_seed
+from vllm.model_executor.parallel_utils.parallel_state import ensure_model_parallel_initialized
 from vllm.utils import (get_ip, get_open_port, get_distributed_init_method,
                         make_async)
 
 logger = init_logger(__name__)
+
+
+class OpenVINOWorker:
+    """A worker class that executes the model on OpenVINO device.
+
+    Currently, OpenVINO supports a single worker at the moment. The worker is
+    responsible for maintaining the KV cache and executing the model on
+    OpenVINO device.
+    """
+
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        parallel_config: ParallelConfig,
+        scheduler_config: SchedulerConfig,
+        device_config: DeviceConfig,
+        lora_config: Optional[LoRAConfig] = None,
+        kv_cache_dtype: Optional[str] = "auto",
+    ) -> None:
+        self.model_config = model_config
+        self.parallel_config = parallel_config
+        self.scheduler_config = scheduler_config
+        self.device_config = device_config
+        self.lora_config = lora_config
+
+        self.model_runner = ModelRunner(model_config,
+                                        parallel_config,
+                                        scheduler_config,
+                                        device_config,
+                                        lora_config=self.lora_config,
+                                        kv_cache_dtype=kv_cache_dtype,
+                                        is_driver_worker=True)
+        # Uninitialized cache engine. Will be initialized by
+        # self.init_cache_engine().
+        self.cache_config = None
+        self.cache_engine = None
+        self.cache_events = None
+        self.gpu_cache = None
+        self.cpu_cache = None
+
+        # Not required for OpenVINO, but without it all CC operations failed
+        self._init_distributed_environment()
+
+    def init_model(self) -> None:
+        # Initialize the model.
+        set_random_seed(self.model_config.seed)
+
+    def load_model(self):
+        self.model_runner.load_model()
+
+    def profile_num_available_blocks(
+        self,
+        block_size: int,
+        gpu_memory_utilization: float,
+        cpu_swap_space: int,
+        cache_dtype: str,
+    ) -> Tuple[int, int]:
+        """Profiles the peak memory usage of the model and returns the maximum
+        number of Accelerator and CPU cache blocks that can be allocated.
+
+        Args:
+            block_size: The size of the cache block.
+            gpu_memory_utilization: The fraction of the total GPU memory to use.
+            cpu_swap_space: The size of the CPU swap space in bytes.
+        """
+        if self.device_config.device.type == 'cpu':
+            cache_block_size = CacheEngine.get_cache_block_size(
+                block_size, cache_dtype, self.model_config, self.parallel_config)
+            num_gpu_blocks = 0
+            num_cpu_blocks = int(cpu_swap_space // cache_block_size)
+            num_cpu_blocks = max(num_cpu_blocks, 0)
+
+            return num_gpu_blocks, num_cpu_blocks
+
+        # TODO: adopt the code below for OpenVINO devices like GPU, NPU
+
+        # # Profile the memory usage of the model and get the maximum number of
+        # # cache blocks that can be allocated with the remaining free memory.
+        # torch.cuda.empty_cache()
+
+        # # Execute a forward pass with dummy inputs to profile the memory usage
+        # # of the model.
+        # self.model_runner.profile_run()
+
+        # # Calculate the number of blocks that can be allocated with the
+        # # profiled peak memory.
+        # torch.cuda.synchronize()
+        # free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
+        # # NOTE(woosuk): Here we assume that the other processes using the same
+        # # GPU did not change their memory usage during the profiling.
+        # peak_memory = self.init_gpu_memory - free_gpu_memory
+
+        # cache_block_size = self.get_cache_block_size_bytes(
+        #     block_size, cache_dtype)
+        # num_gpu_blocks = int(
+        #     (total_gpu_memory * gpu_memory_utilization - peak_memory) //
+        #     cache_block_size)
+        # num_cpu_blocks = int(cpu_swap_space // cache_block_size)
+        # num_gpu_blocks = max(num_gpu_blocks, 0)
+        # num_cpu_blocks = max(num_cpu_blocks, 0)
+        # if self.model_runner.lora_manager:
+        #     self.model_runner.remove_all_loras()
+        # gc.collect()
+        # torch.cuda.empty_cache()
+        # return num_gpu_blocks, num_cpu_blocks
+
+    def init_cache_engine(self, cache_config: CacheConfig) -> None:
+        self.cache_config = cache_config
+        self.cache_engine = CacheEngine(self.cache_config, self.model_config,
+                                        self.parallel_config)
+        self.cache_events = self.cache_engine.events
+        self.gpu_cache = self.cache_engine.gpu_cache
+        self.cpu_cache = self.cache_engine.cpu_cache
+        self.model_runner.set_block_size(self.cache_engine.block_size)
+
+    def cache_swap(
+        self,
+        blocks_to_swap_in: Dict[int, int],
+        blocks_to_swap_out: Dict[int, int],
+        blocks_to_copy: Dict[int, List[int]],
+    ) -> None:
+        # Issue cache operations.
+        issued_cache_op = False
+        if blocks_to_swap_in:
+            self.cache_engine.swap_in(blocks_to_swap_in)
+            issued_cache_op = True
+        if blocks_to_swap_out:
+            self.cache_engine.swap_out(blocks_to_swap_out)
+            issued_cache_op = True
+        if blocks_to_copy:
+            self.cache_engine.copy(blocks_to_copy)
+            issued_cache_op = True
+
+        cache_events = self.cache_events if issued_cache_op else None
+
+        # Wait for cache operations to finish.
+        # TODO: ilavrenov, probably, we need similar for GPU
+        if cache_events is not None:
+            for event in cache_events:
+                event.wait()
+
+    def execute_model(
+        self,
+        seq_group_metadata_list: Optional[List[SequenceGroupMetadata]] = None,
+        blocks_to_swap_in: Optional[Dict[int, int]] = None,
+        blocks_to_swap_out: Optional[Dict[int, int]] = None,
+        blocks_to_copy: Optional[Dict[int, List[int]]] = None,
+    ) -> Optional[SamplerOutput]:
+        self.cache_swap(blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy)
+
+        # If there is no input, we don't need to execute the model.
+        if len(seq_group_metadata_list) == 0:
+            return {}
+
+        device_cache = self.gpu_cache if self.device_config.device.type == 'gpu' else self.cpu_cache
+        output = self.model_runner.execute_model(seq_group_metadata_list, device_cache)
+        return output
+
+    def add_lora(self, lora_request: LoRARequest) -> bool:
+        return self.model_runner.add_lora(lora_request)
+
+    def remove_lora(self, lora_id: int) -> bool:
+        return self.model_runner.remove_lora(lora_id)
+
+    def list_loras(self) -> Set[int]:
+        return self.model_runner.list_loras()
+
+    @property
+    def max_model_len(self) -> int:
+        return self.model_config.max_model_len
+
+    @property
+    def vocab_size(self) -> int:
+        return self.model_runner.vocab_size
+
+    def get_cache_block_size_bytes(self, block_size: int,
+                                   cache_dtype: str) -> int:
+        """Get the size of the KV cache block size in bytes.
+        """
+        return CacheEngine.get_cache_block_size(block_size, cache_dtype,
+                                                self.model_config,
+                                                self.parallel_config)
+
+    def _init_distributed_environment(self) -> None:
+        """Initialize the distributed environment."""
+        distributed_init_method = get_distributed_init_method(
+            get_ip(), get_open_port())
+        rank = 0
+        backend = "gloo"
+
+        if torch.distributed.is_initialized():
+            torch_world_size = torch.distributed.get_world_size()
+            if torch_world_size != self.parallel_config.world_size:
+                raise RuntimeError(
+                    "torch.distributed is already initialized but the torch world "
+                    "size does not match parallel_config.world_size "
+                    f"({torch_world_size} vs. {self.parallel_config.world_size}).")
+        elif not distributed_init_method:
+            raise ValueError(
+                "distributed_init_method must be set if torch.distributed "
+                "is not already initialized")
+        else:
+            torch.distributed.init_process_group(
+                backend=backend,
+                world_size=self.parallel_config.world_size,
+                rank=rank,
+                init_method=distributed_init_method,
+            )
+
+        # A small all_reduce for warmup.
+        torch.distributed.all_reduce(torch.zeros(1, device=self.device_config.device))
+        ensure_model_parallel_initialized(self.parallel_config.tensor_parallel_size,
+                                          self.parallel_config.pipeline_parallel_size)
 
 def _patch_model_with_openvino(model, model_config):
     if hasattr(model, '_openvino_patch_orig_forward'):
@@ -310,20 +527,13 @@ class OpenVINOExecutor(ExecutorBase):
         assert self.parallel_config.world_size == 1, (
             "OpenVINO worker only supports single inference device.")
 
-        # TODO: remove distributed_init_method usage
-        distributed_init_method = get_distributed_init_method(
-            get_ip(), get_open_port())
         self.driver_worker = Worker(
             self.model_config,
             self.parallel_config,
             self.scheduler_config,
             self.device_config,
-            local_rank=0,
-            rank=0,
-            distributed_init_method=distributed_init_method,
             lora_config=self.lora_config,
             kv_cache_dtype=self.cache_config.cache_dtype,
-            is_driver_worker=True,
         )
         self.driver_worker.init_model()
         self.driver_worker.load_model()
