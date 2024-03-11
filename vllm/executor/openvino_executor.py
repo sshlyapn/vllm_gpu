@@ -47,16 +47,16 @@ class OpenVINOCacheEngine:
         self.num_cpu_blocks = cache_config.num_cpu_blocks
 
         if cache_config.cache_dtype == "auto":
-            self.dtype = model_config.dtype
+            self.cache_dtype = model_config.dtype
         else:
-            self.dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+            self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
 
         # Initialize the cache.
         self.gpu_cache = self.allocate_gpu_cache()
         self.cpu_cache = self.allocate_cpu_cache()
 
     def get_key_block_shape(self) -> Tuple[int, int, int, int]:
-        element_size = torch.tensor([], dtype=self.dtype).element_size()
+        element_size = torch.tensor([], dtype=self.cache_dtype).element_size()
         x = 16 // element_size
         return (
             self.num_heads,
@@ -87,12 +87,12 @@ class OpenVINOCacheEngine:
         for _ in range(self.num_layers):
             key_blocks = torch.empty(
                 size=(self.num_cpu_blocks, *key_block_shape),
-                dtype=self.dtype,
+                dtype=self.cache_dtype,
                 device="cpu",
             )
             value_blocks = torch.empty(
                 size=(self.num_cpu_blocks, *value_block_shape),
-                dtype=self.dtype,
+                dtype=self.cache_dtype,
                 device="cpu",
             )
             cpu_cache.append((key_blocks, value_blocks))
@@ -104,7 +104,7 @@ class OpenVINOCacheEngine:
         dst: List[KVCache],
         src_to_dst: Dict[int, int],
     ) -> None:
-        # TODO: ilavreno: implement cache sync via OpenVINO RemoteContext API h <-> d
+        # TODO: ilavreno: implement cache sync via OpenVINO RemoteContext API host <-> device
         assert False
 
     def swap_in(self, src_to_dst: Dict[int, int]) -> None:
@@ -116,7 +116,7 @@ class OpenVINOCacheEngine:
     def copy(self, src_to_dsts: Dict[int, List[int]]) -> None:
         key_caches = [key_cache for key_cache, _ in self.gpu_cache]
         value_caches = [value_cache for _, value_cache in self.gpu_cache]
-        # TODO: ilavreno: implement cache sync via OpenVINO RemoteContext API d -> d
+        # TODO: ilavreno: implement cache sync via OpenVINO RemoteContext API device -> device
         # cache_ops.copy_blocks(key_caches, value_caches, src_to_dsts)
 
     @staticmethod
@@ -134,11 +134,11 @@ class OpenVINOCacheEngine:
         value_cache_block = key_cache_block
         total = num_layers * (key_cache_block + value_cache_block)
         if cache_dtype == "auto":
-            dtype = model_config.dtype
+            cache_dtype = model_config.dtype
         else:
-            dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
-        dtype_size = dtype.itemsize
-        return dtype_size * total
+            cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
+        cache_dtype_size = cache_dtype.itemsize
+        return cache_dtype_size * total
 
 
 class OpenVINOWorker:
@@ -164,6 +164,9 @@ class OpenVINOWorker:
         self.device_config = device_config
         self.lora_config = lora_config
 
+        # Load FP32 models to OpenVINO
+        model_config.dtype = torch.float32
+
         self.model_runner = ModelRunner(model_config,
                                         parallel_config,
                                         scheduler_config,
@@ -174,7 +177,6 @@ class OpenVINOWorker:
         # Uninitialized cache engine. Will be initialized by self.init_cache_engine().
         self.cache_config = None
         self.cache_engine = None
-        self.cache_events = None
         self.gpu_cache = None
         self.cpu_cache = None
 
@@ -212,37 +214,8 @@ class OpenVINOWorker:
 
             return num_gpu_blocks, num_cpu_blocks
 
-        # TODO: adopt the code below for OpenVINO devices like GPU, NPU
-
-        # # Profile the memory usage of the model and get the maximum number of
-        # # cache blocks that can be allocated with the remaining free memory.
-        # torch.cuda.empty_cache()
-
-        # # Execute a forward pass with dummy inputs to profile the memory usage
-        # # of the model.
-        # self.model_runner.profile_run()
-
-        # # Calculate the number of blocks that can be allocated with the
-        # # profiled peak memory.
-        # torch.cuda.synchronize()
-        # free_gpu_memory, total_gpu_memory = torch.cuda.mem_get_info()
-        # # NOTE(woosuk): Here we assume that the other processes using the same
-        # # GPU did not change their memory usage during the profiling.
-        # peak_memory = self.init_gpu_memory - free_gpu_memory
-
-        # cache_block_size = self.get_cache_block_size_bytes(
-        #     block_size, cache_dtype)
-        # num_gpu_blocks = int(
-        #     (total_gpu_memory * gpu_memory_utilization - peak_memory) //
-        #     cache_block_size)
-        # num_cpu_blocks = int(cpu_swap_space // cache_block_size)
-        # num_gpu_blocks = max(num_gpu_blocks, 0)
-        # num_cpu_blocks = max(num_cpu_blocks, 0)
-        # if self.model_runner.lora_manager:
-        #     self.model_runner.remove_all_loras()
-        # gc.collect()
-        # torch.cuda.empty_cache()
-        # return num_gpu_blocks, num_cpu_blocks
+        # TODO: ilavreno: profile GPU run and compute available memory which can be
+        # used for KV cache blocks
 
     def init_cache_engine(self, cache_config: CacheConfig) -> None:
         self.cache_config = cache_config
@@ -291,6 +264,7 @@ class OpenVINOWorker:
         if len(seq_group_metadata_list) == 0:
             return {}
 
+        # TODO: ilavreno: currently device.type cannot be GPU, need to find a way to pass device to OpenVINO backend
         device_cache = self.gpu_cache if self.device_config.device.type == 'gpu' else self.cpu_cache
         output = self.model_runner.execute_model(seq_group_metadata_list, device_cache)
         return output

@@ -9,7 +9,7 @@ prompts = [
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 # Create an LLM.
-llm = LLM(model="bigscience/bloom-560m", device="cpu", dtype=torch.float32, enforce_eager=True)
+llm = LLM(model="bigscience/bloom-560m", device="openvino")
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
 outputs = llm.generate(prompts, sampling_params)

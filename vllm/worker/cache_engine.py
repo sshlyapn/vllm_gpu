@@ -51,15 +51,11 @@ class CacheEngine:
         self.gpu_cache = self.allocate_gpu_cache()
         self.cpu_cache = self.allocate_cpu_cache()
 
-        if self.num_gpu_blocks > 0:
-            # Initialize the stream for caching operations.
-            self.cache_stream = torch.cuda.Stream()
-            assert self.cache_stream != torch.cuda.current_stream()
-            # Initialize the events for stream synchronization.
-            self.events = [torch.cuda.Event() for _ in range(self.num_layers)]
-        else:
-            self.cache_stream = None
-            self.events = None
+        # Initialize the stream for caching operations.
+        self.cache_stream = torch.cuda.Stream()
+        assert self.cache_stream != torch.cuda.current_stream()
+        # Initialize the events for stream synchronization.
+        self.events = [torch.cuda.Event() for _ in range(self.num_layers)]
 
     def get_key_block_shape(self) -> Tuple[int, int, int, int]:
         element_size = torch.tensor([], dtype=self.dtype).element_size()
@@ -79,9 +75,6 @@ class CacheEngine:
         )
 
     def allocate_gpu_cache(self) -> List[KVCache]:
-        if self.num_gpu_blocks == 0:
-            return None
-
         gpu_cache: List[KVCache] = []
         key_block_shape = self.get_key_block_shape()
         value_block_shape = self.get_value_block_shape()
@@ -103,7 +96,7 @@ class CacheEngine:
         cpu_cache: List[KVCache] = []
         key_block_shape = self.get_key_block_shape()
         value_block_shape = self.get_value_block_shape()
-        pin_memory = not in_wsl() and self.num_gpu_blocks > 0
+        pin_memory = not in_wsl()
         if not pin_memory:
             # Pinning memory in WSL is not supported.
             # https://docs.nvidia.com/cuda/wsl-user-guide/index.html#known-limitations-for-linux-cuda-applications

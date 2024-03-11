@@ -8,7 +8,7 @@ from transformers import PretrainedConfig
 
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_config
-from vllm.utils import get_cpu_memory, is_hip, is_neuron, get_nvcc_cuda_version
+from vllm.utils import get_cpu_memory, is_hip, is_neuron, is_openvino, get_nvcc_cuda_version
 
 if TYPE_CHECKING:
     from ray.util.placement_group import PlacementGroup
@@ -509,6 +509,8 @@ class DeviceConfig:
                 self.device_type = "cuda"
             elif is_neuron():
                 self.device_type = "neuron"
+            elif is_openvino():
+                self.device_type = "openvino"
             else:
                 raise RuntimeError("No supported device detected.")
         else:
@@ -516,7 +518,7 @@ class DeviceConfig:
             self.device_type = device
 
         # Some device types require processing inputs on CPU
-        if self.device_type in ["neuron"]:
+        if self.device_type in ["neuron", "openvino"]:
             self.device = torch.device("cpu")
         else:
             # Set device with device type
@@ -525,6 +527,10 @@ class DeviceConfig:
     @property
     def is_neuron(self):
         return self.device_type == "neuron"
+
+    @property
+    def is_openvino(self):
+        return self.device_type == "openvino"
 
 
 @dataclass
