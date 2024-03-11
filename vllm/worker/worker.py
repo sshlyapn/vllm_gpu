@@ -67,6 +67,7 @@ class Worker:
         self.cache_engine = None
         self.cache_events = None
         self.gpu_cache = None
+        self.cpu_cache = None
 
     def init_model(self, cupy_port: Optional[int] = None) -> None:
         if self.device_config.device.type == "cuda":
@@ -87,10 +88,10 @@ class Worker:
             torch.cuda.empty_cache()
             self.init_gpu_memory = torch.cuda.mem_get_info()[0]
         else:
-            raise RuntimeError(
-                f"Not support device type: {self.device_config.device}")
+            self.rank = 0
+            self.device = torch.device("cpu")
         # Initialize the distributed environment.
-        init_distributed_environment(self.parallel_config, self.rank,
+        init_distributed_environment(self.parallel_config, self.device_config, self.rank,
                                      cupy_port, self.distributed_init_method)
         # Initialize the model.
         set_random_seed(self.model_config.seed)
@@ -114,6 +115,15 @@ class Worker:
             gpu_memory_utilization: The fraction of the total GPU memory to use.
             cpu_swap_space: The size of the CPU swap space in bytes.
         """
+        if self.device_config.device.type == 'cpu':
+            cache_block_size = CacheEngine.get_cache_block_size(
+                block_size, cache_dtype, self.model_config, self.parallel_config)
+            num_gpu_blocks = 0
+            num_cpu_blocks = int(cpu_swap_space // cache_block_size)
+            num_cpu_blocks = max(num_cpu_blocks, 0)
+
+            return num_gpu_blocks, num_cpu_blocks
+
         # Profile the memory usage of the model and get the maximum number of
         # cache blocks that can be allocated with the remaining free memory.
         torch.cuda.empty_cache()
@@ -150,6 +160,7 @@ class Worker:
                                         self.parallel_config)
         self.cache_events = self.cache_engine.events
         self.gpu_cache = self.cache_engine.gpu_cache
+        self.cpu_cache = self.cache_engine.cpu_cache
         self.model_runner.set_block_size(self.cache_engine.block_size)
 
     def warm_up_model(self) -> None:
@@ -220,7 +231,7 @@ class Worker:
             return {}
 
         output = self.model_runner.execute_model(seq_group_metadata_list,
-                                                 self.gpu_cache)
+                                                 self.gpu_cache if self.device_config.device.type == 'cuda' else self.cpu_cache)
         return output
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -251,6 +262,7 @@ class Worker:
 
 def init_distributed_environment(
     parallel_config: ParallelConfig,
+    device_config: DeviceConfig,
     rank: int,
     cupy_port: Optional[int],
     distributed_init_method: Optional[str] = None,
@@ -294,9 +306,9 @@ def init_distributed_environment(
         )
 
     # A small all_reduce for warmup.
-    torch.distributed.all_reduce(torch.zeros(1).cuda())
+    torch.distributed.all_reduce(torch.zeros(1, device=device_config.device))
     if cupy_utils.is_initialized():
-        cupy_utils.all_reduce(torch.zeros(1).cuda())
+        cupy_utils.all_reduce(torch.zeros(1, device=device_config.device))
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
 

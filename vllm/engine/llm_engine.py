@@ -633,7 +633,7 @@ class LLMEngine:
         # KV Cache Usage in %.
         num_total_gpu = self.cache_config.num_gpu_blocks
         num_free_gpu = self.scheduler.block_manager.get_num_free_gpu_blocks()
-        gpu_cache_usage = 1.0 - (num_free_gpu / num_total_gpu)
+        gpu_cache_usage = (1.0 - (num_free_gpu / num_total_gpu)) if num_total_gpu > 0 else 0.0
 
         num_total_cpu = self.cache_config.num_cpu_blocks
         cpu_cache_usage = 0.
