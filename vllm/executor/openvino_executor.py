@@ -8,15 +8,137 @@ from vllm.executor.executor_base import ExecutorAsyncBase, ExecutorBase
 from vllm.executor.utils import check_block_size_valid
 from vllm.logger import init_logger
 from vllm.sequence import SamplerOutput, SequenceGroupMetadata
-from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.model_runner import ModelRunner
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
 from vllm.model_executor.parallel_utils.parallel_state import ensure_model_parallel_initialized
 from vllm.utils import (get_ip, get_open_port, get_distributed_init_method,
-                        make_async)
+                        make_async, STR_DTYPE_TO_TORCH_DTYPE)
 
 logger = init_logger(__name__)
+
+
+KVCache = Tuple[torch.Tensor, torch.Tensor]
+
+class OpenVINOCacheEngine:
+    """Manages the KV cache.
+
+    This class is responsible for initializing and managing the GPU and CPU KV
+    caches. It also provides methods for performing KV cache operations, such
+    as swapping and copying.
+    """
+
+    def __init__(
+        self,
+        cache_config: CacheConfig,
+        model_config: ModelConfig,
+        parallel_config: ParallelConfig,
+    ) -> None:
+        self.cache_config = cache_config
+        self.model_config = model_config
+        self.parallel_config = parallel_config
+
+        self.head_size = model_config.get_head_size()
+        self.num_layers = model_config.get_num_layers(parallel_config)
+        self.num_heads = model_config.get_num_kv_heads(parallel_config)
+
+        self.block_size = cache_config.block_size
+        self.num_gpu_blocks = cache_config.num_gpu_blocks
+        self.num_cpu_blocks = cache_config.num_cpu_blocks
+
+        if cache_config.cache_dtype == "auto":
+            self.dtype = model_config.dtype
+        else:
+            self.dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+
+        # Initialize the cache.
+        self.gpu_cache = self.allocate_gpu_cache()
+        self.cpu_cache = self.allocate_cpu_cache()
+
+    def get_key_block_shape(self) -> Tuple[int, int, int, int]:
+        element_size = torch.tensor([], dtype=self.dtype).element_size()
+        x = 16 // element_size
+        return (
+            self.num_heads,
+            self.head_size // x,
+            self.block_size,
+            x,
+        )
+
+    def get_value_block_shape(self) -> Tuple[int, int, int]:
+        return (
+            self.num_heads,
+            self.head_size,
+            self.block_size,
+        )
+
+    def allocate_gpu_cache(self) -> List[KVCache]:
+        # TODO: use OpenVINO RemoteTensor API
+        if self.num_gpu_blocks == 0:
+            return None
+
+        gpu_cache: List[KVCache] = []
+        return gpu_cache
+
+    def allocate_cpu_cache(self) -> List[KVCache]:
+        cpu_cache: List[KVCache] = []
+        key_block_shape = self.get_key_block_shape()
+        value_block_shape = self.get_value_block_shape()
+        for _ in range(self.num_layers):
+            key_blocks = torch.empty(
+                size=(self.num_cpu_blocks, *key_block_shape),
+                dtype=self.dtype,
+                device="cpu",
+            )
+            value_blocks = torch.empty(
+                size=(self.num_cpu_blocks, *value_block_shape),
+                dtype=self.dtype,
+                device="cpu",
+            )
+            cpu_cache.append((key_blocks, value_blocks))
+        return cpu_cache
+
+    def _swap(
+        self,
+        src: List[KVCache],
+        dst: List[KVCache],
+        src_to_dst: Dict[int, int],
+    ) -> None:
+        # TODO: ilavreno: implement cache sync via OpenVINO RemoteContext API h <-> d
+        assert False
+
+    def swap_in(self, src_to_dst: Dict[int, int]) -> None:
+        self._swap(self.cpu_cache, self.gpu_cache, src_to_dst)
+
+    def swap_out(self, src_to_dst: Dict[int, int]) -> None:
+        self._swap(self.gpu_cache, self.cpu_cache, src_to_dst)
+
+    def copy(self, src_to_dsts: Dict[int, List[int]]) -> None:
+        key_caches = [key_cache for key_cache, _ in self.gpu_cache]
+        value_caches = [value_cache for _, value_cache in self.gpu_cache]
+        # TODO: ilavreno: implement cache sync via OpenVINO RemoteContext API d -> d
+        # cache_ops.copy_blocks(key_caches, value_caches, src_to_dsts)
+
+    @staticmethod
+    def get_cache_block_size(
+        block_size: int,
+        cache_dtype: str,
+        model_config: ModelConfig,
+        parallel_config: ParallelConfig,
+    ) -> int:
+        head_size = model_config.get_head_size()
+        num_heads = model_config.get_num_kv_heads(parallel_config)
+        num_layers = model_config.get_num_layers(parallel_config)
+
+        key_cache_block = block_size * num_heads * head_size
+        value_cache_block = key_cache_block
+        total = num_layers * (key_cache_block + value_cache_block)
+        if cache_dtype == "auto":
+            dtype = model_config.dtype
+        else:
+            dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
+        dtype_size = dtype.itemsize
+        return dtype_size * total
 
 
 class OpenVINOWorker:
@@ -49,15 +171,14 @@ class OpenVINOWorker:
                                         lora_config=self.lora_config,
                                         kv_cache_dtype=kv_cache_dtype,
                                         is_driver_worker=True)
-        # Uninitialized cache engine. Will be initialized by
-        # self.init_cache_engine().
+        # Uninitialized cache engine. Will be initialized by self.init_cache_engine().
         self.cache_config = None
         self.cache_engine = None
         self.cache_events = None
         self.gpu_cache = None
         self.cpu_cache = None
 
-        # Not required for OpenVINO, but without it all CC operations failed
+        # Not required for OpenVINO, but without torch.distributed initialization all CC operations failed
         self._init_distributed_environment()
 
     def init_model(self) -> None:
@@ -83,7 +204,7 @@ class OpenVINOWorker:
             cpu_swap_space: The size of the CPU swap space in bytes.
         """
         if self.device_config.device.type == 'cpu':
-            cache_block_size = CacheEngine.get_cache_block_size(
+            cache_block_size = OpenVINOCacheEngine.get_cache_block_size(
                 block_size, cache_dtype, self.model_config, self.parallel_config)
             num_gpu_blocks = 0
             num_cpu_blocks = int(cpu_swap_space // cache_block_size)
@@ -125,9 +246,8 @@ class OpenVINOWorker:
 
     def init_cache_engine(self, cache_config: CacheConfig) -> None:
         self.cache_config = cache_config
-        self.cache_engine = CacheEngine(self.cache_config, self.model_config,
-                                        self.parallel_config)
-        self.cache_events = self.cache_engine.events
+        self.cache_engine = OpenVINOCacheEngine(self.cache_config, self.model_config,
+                                                self.parallel_config)
         self.gpu_cache = self.cache_engine.gpu_cache
         self.cpu_cache = self.cache_engine.cpu_cache
         self.model_runner.set_block_size(self.cache_engine.block_size)
@@ -196,9 +316,9 @@ class OpenVINOWorker:
                                    cache_dtype: str) -> int:
         """Get the size of the KV cache block size in bytes.
         """
-        return CacheEngine.get_cache_block_size(block_size, cache_dtype,
-                                                self.model_config,
-                                                self.parallel_config)
+        return OpenVINOCacheEngine.get_cache_block_size(block_size, cache_dtype,
+                                                        self.model_config,
+                                                        self.parallel_config)
 
     def _init_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
@@ -516,18 +636,11 @@ class OpenVINOExecutor(ExecutorBase):
         # Profile the memory usage and initialize the cache.
         self._init_cache()
 
-    def _dispatch_worker(self):
-        # TODO: current OpenVINO worker is created from generic Worder by specifying
-        # CPU as device_config.device
-        return OpenVINOWorker
-
     def _init_worker(self):
-        Worker = self._dispatch_worker()
-
         assert self.parallel_config.world_size == 1, (
             "OpenVINO worker only supports single inference device.")
 
-        self.driver_worker = Worker(
+        self.driver_worker = OpenVINOWorker(
             self.model_config,
             self.parallel_config,
             self.scheduler_config,
@@ -587,13 +700,13 @@ class OpenVINOExecutor(ExecutorBase):
         return output
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
-        raise NotImplementedError
+        return self.model_runner.add_lora(lora_request)
 
     def remove_lora(self, lora_id: int) -> bool:
-        raise NotImplementedError
+        return self.model_runner.remove_lora(lora_id)
 
     def list_loras(self) -> List[int]:
-        raise NotImplementedError
+        return self.model_runner.list_loras()
 
     def check_health(self) -> None:
         # OpenVINO will always be healthy as long as it's running.

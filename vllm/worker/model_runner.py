@@ -85,16 +85,11 @@ class ModelRunner:
             self.model_config.enforce_eager = True
 
     def load_model(self) -> None:
-        # with measure_cuda_memory() as m:
         self.model = get_model(self.model_config,
                                self.device_config,
                                lora_config=self.lora_config,
                                parallel_config=self.parallel_config,
                                scheduler_config=self.scheduler_config)
-
-        # self.model_memory_usage = m.consumed_memory
-        # logger.info(f"Loading model weights took "
-        #             f"{self.model_memory_usage / float(2**30):.4f} GB")
 
         if self.lora_config:
             assert hasattr(self.model, "supported_lora_modules"
