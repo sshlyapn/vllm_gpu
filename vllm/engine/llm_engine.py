@@ -19,7 +19,7 @@ from vllm.sequence import (Logprob, SamplerOutput, Sequence, SequenceGroup,
                            SequenceGroupOutput, SequenceOutput, SequenceStatus)
 from vllm.transformers_utils.tokenizer import (detokenize_incrementally,
                                                TokenizerGroup)
-from vllm.utils import Counter
+from vllm.utils import Counter, is_openvino, is_openvino_optimum_intel
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
@@ -122,7 +122,10 @@ class LLMEngine:
         parallel_config = engine_configs[2]
 
         # Initialize the cluster and specify the executor class.
-        if parallel_config.worker_use_ray:
+        if is_openvino() or is_openvino_optimum_intel():
+            from vllm.executor.openvino_executor import OpenVINOExecutor
+            executor_class = OpenVINOExecutor
+        elif parallel_config.worker_use_ray:
             initialize_ray_cluster(parallel_config)
             from vllm.executor.ray_gpu_executor import RayGPUExecutor
             executor_class = RayGPUExecutor

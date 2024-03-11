@@ -280,8 +280,12 @@ def init_distributed_environment(
             "distributed_init_method must be set if torch.distributed "
             "is not already initialized")
     else:
+        backend = "nccl"
+        if device_config.device == torch.device('cpu'):
+            backend = "gloo"
+
         torch.distributed.init_process_group(
-            backend="nccl",
+            backend=backend,
             world_size=parallel_config.world_size,
             rank=rank,
             init_method=distributed_init_method,

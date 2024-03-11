@@ -1,5 +1,6 @@
 """A layer that samples the next tokens from the model's outputs."""
 from typing import Dict, List, Optional, Tuple
+import os
 
 import torch
 import torch.nn as nn
@@ -12,7 +13,7 @@ from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import (Logprob, PromptLogprobs, SampleLogprobs,
                            SamplerOutput, SequenceData, SequenceGroupOutput,
                            SequenceOutput)
-from vllm.utils import is_neuron
+from vllm.utils import is_neuron, is_openvino_optimum_intel
 
 
 class Sampler(nn.Module):
@@ -35,8 +36,8 @@ class Sampler(nn.Module):
                  org_vocab_size: Optional[int] = None) -> None:
         super().__init__()
         self.vocab_size = vocab_size
-        # Transformers-neuronx generate outputs as logits directly.
-        self.logits_as_hidden_states = is_neuron()
+        # Transformers-neuronx / OpenVINO optimum-intel generate outputs as logits directly.
+        self.logits_as_hidden_states = is_neuron() or is_openvino_optimum_intel()
         # original vocabulary size (without LoRA).
         self.org_vocab_size = org_vocab_size or vocab_size
 
@@ -62,6 +63,8 @@ class Sampler(nn.Module):
         # Get the hidden states that we use for sampling.
         if self.logits_as_hidden_states:
             logits = hidden_states
+            if is_openvino_optimum_intel():
+                logits = _prune_hidden_states(logits, sampling_metadata)
         else:
             hidden_states = _prune_hidden_states(hidden_states,
                                                  sampling_metadata)

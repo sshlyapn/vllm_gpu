@@ -187,9 +187,9 @@ class BlockSpaceManager:
         else:
             return AllocStatus.LATER
 
-    def allocate(self,
-                 block_hash: Optional[int] = None,
-                 num_hashed_tokens: int = 0) -> PhysicalTokenBlock:
+    def _allocate(self,
+                  block_hash: Optional[int] = None,
+                  num_hashed_tokens: int = 0) -> PhysicalTokenBlock:
         if not self.cpu_only:
             return self.gpu_allocator.allocate(block_hash, num_hashed_tokens)
         else:

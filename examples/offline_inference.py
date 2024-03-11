@@ -1,17 +1,15 @@
 from vllm import LLM, SamplingParams
+import torch
 
 # Sample prompts.
 prompts = [
-    "Hello, my name is",
-    "The president of the United States is",
-    "The capital of France is",
-    "The future of AI is",
+    "What is OpenVINO?",
 ]
 # Create a sampling params object.
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 # Create an LLM.
-llm = LLM(model="facebook/opt-125m")
+llm = LLM(model="bigscience/bloom-560m", device="cpu", dtype=torch.float32, enforce_eager=True)
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
 outputs = llm.generate(prompts, sampling_params)

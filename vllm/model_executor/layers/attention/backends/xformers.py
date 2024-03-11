@@ -3,9 +3,17 @@ import importlib
 from typing import List, Optional
 
 import torch
-from xformers import ops as xops
-from xformers.ops.fmha.attn_bias import (BlockDiagonalCausalMask,
-                                         LowerTriangularMaskWithTensorBias)
+
+try:
+    from xformers import ops as xops
+except:
+    pass
+
+try:
+    from xformers.ops.fmha.attn_bias import (BlockDiagonalCausalMask,
+                                            LowerTriangularMaskWithTensorBias)
+except:
+    pass
 
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.attention.ops.paged_attn import (
@@ -42,6 +50,7 @@ class XFormersBackend:
                 f"Supported head sizes are: {suppored_head_sizes}.")
 
         self.use_ref_attention = _check_use_ref_attention()
+        self.cpu_only = torch.zeros((1)).is_cpu
 
     def forward(
         self,
@@ -155,7 +164,11 @@ class XFormersBackend:
                     scale=self.scale,
                     op=xops.fmha.MemoryEfficientAttentionFlashAttentionOp[0] if
                     (is_hip()) else None,
-                )
+                ) if self.cpu_only else torch.nn.functional.scaled_dot_product_attention(
+                    query.movedim(1, query.dim() -2), key.movedim(1, query.dim() - 2),
+                    value.movedim(1, value.dim() - 2), 
+                    input_metadata.attn_bias,
+                    0.0).movedim(query.dim() - 2, 1).contiguous()
                 output = out.view_as(query)
 
             else:
@@ -191,7 +204,7 @@ def _make_alibi_bias(
     batch_size: int,
     seq_len: int,
     dtype: torch.dtype,
-) -> LowerTriangularMaskWithTensorBias:
+) -> "LowerTriangularMaskWithTensorBias":
     bias = torch.arange(seq_len, dtype=dtype)
     # NOTE(zhuohan): HF uses
     #     `bias = bias[None, :].repeat(prompt_len, 1)`

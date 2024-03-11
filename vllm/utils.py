@@ -126,6 +126,11 @@ def is_neuron() -> bool:
         transformers_neuronx = None
     return transformers_neuronx is not None
 
+def is_openvino() -> bool:
+    return True if os.getenv('VLLM_OPENVINO', "0") == "1" else False
+
+def is_openvino_optimum_intel() -> bool:
+    return True if os.getenv('VLLM_OPENVINO_OPTIMUM', "0") == "1" else False
 
 def get_max_shared_memory_bytes(gpu: int = 0) -> int:
     """Returns the maximum shared memory per thread block in bytes."""

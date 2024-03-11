@@ -85,16 +85,16 @@ class ModelRunner:
             self.model_config.enforce_eager = True
 
     def load_model(self) -> None:
-        with measure_cuda_memory() as m:
-            self.model = get_model(self.model_config,
-                                   self.device_config,
-                                   lora_config=self.lora_config,
-                                   parallel_config=self.parallel_config,
-                                   scheduler_config=self.scheduler_config)
+        # with measure_cuda_memory() as m:
+        self.model = get_model(self.model_config,
+                               self.device_config,
+                               lora_config=self.lora_config,
+                               parallel_config=self.parallel_config,
+                               scheduler_config=self.scheduler_config)
 
-        self.model_memory_usage = m.consumed_memory
-        logger.info(f"Loading model weights took "
-                    f"{self.model_memory_usage / float(2**30):.4f} GB")
+        # self.model_memory_usage = m.consumed_memory
+        # logger.info(f"Loading model weights took "
+        #             f"{self.model_memory_usage / float(2**30):.4f} GB")
 
         if self.lora_config:
             assert hasattr(self.model, "supported_lora_modules"
@@ -408,7 +408,7 @@ class ModelRunner:
         selected_token_start_idx = 0
         categorized_sample_indices = {t: [] for t in SamplingType}
         categorized_sample_indices_start_idx = 0
-        pin_memory = not self.in_wsl and not self.device_config.is_neuron
+        pin_memory = not (self.in_wsl or self.device_config.is_neuron or self.device.type == "cpu")
 
         max_subquery_len = max(subquery_lens) if subquery_lens else 1
         for i, seq_group_metadata in enumerate(seq_group_metadata_list):
