@@ -439,7 +439,7 @@ class ModelRunner:
 
                 if sampling_params.seed is not None:
                     seq_group_metadata.state.generator = torch.Generator(
-                        device="cpu").manual_seed(sampling_params.seed)
+                        device=self.device_config.device).manual_seed(sampling_params.seed)
             else:
                 num_seqs = len(seq_ids)
                 selected_token_indices.extend(

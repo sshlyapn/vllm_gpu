@@ -19,7 +19,7 @@ from vllm.sequence import (Logprob, SamplerOutput, Sequence, SequenceGroup,
                            SequenceGroupOutput, SequenceOutput, SequenceStatus)
 from vllm.transformers_utils.tokenizer import (detokenize_incrementally,
                                                TokenizerGroup)
-from vllm.utils import Counter, is_openvino, is_openvino_optimum_intel
+from vllm.utils import Counter
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
@@ -120,9 +120,10 @@ class LLMEngine:
         # Create the engine configs.
         engine_configs = engine_args.create_engine_configs()
         parallel_config = engine_configs[2]
+        device_config = engine_configs[4]
 
         # Initialize the cluster and specify the executor class.
-        if is_openvino() or is_openvino_optimum_intel():
+        if device_config.is_openvino:
             from vllm.executor.openvino_executor import OpenVINOExecutor
             executor_class = OpenVINOExecutor
         elif parallel_config.worker_use_ray:
@@ -634,16 +635,13 @@ class LLMEngine:
         now = time.monotonic()
 
         # KV Cache Usage in %.
-        num_total_gpu = self.cache_config.num_gpu_blocks
+        num_total_gpu = max(1, self.cache_config.num_gpu_blocks)
         num_free_gpu = self.scheduler.block_manager.get_num_free_gpu_blocks()
-        gpu_cache_usage = (1.0 - (num_free_gpu / num_total_gpu)) if num_total_gpu > 0 else 0.0
+        gpu_cache_usage = 1.0 - (num_free_gpu / num_total_gpu)
 
-        num_total_cpu = self.cache_config.num_cpu_blocks
-        cpu_cache_usage = 0.
-        if num_total_cpu > 0:
-            num_free_cpu = self.scheduler.block_manager.get_num_free_cpu_blocks(
-            )
-            cpu_cache_usage = 1.0 - (num_free_cpu / num_total_cpu)
+        num_total_cpu = max(1, self.cache_config.num_cpu_blocks)
+        num_free_cpu = self.scheduler.block_manager.get_num_free_cpu_blocks()
+        cpu_cache_usage = 1.0 - (num_free_cpu / num_total_cpu)
 
         # Scheduler State
         num_running = len(self.scheduler.running)

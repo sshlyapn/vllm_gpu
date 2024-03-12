@@ -28,18 +28,9 @@ def _flattenize_inputs(inputs):
             flatten_inputs.append(input_data)
     return flatten_inputs
 
-
-def _prepare_data(tensor):
-    tensor = np.array(tensor, copy=False)
-    assert tensor.flags["C_CONTIGUOUS"]
-    return tensor
-
-
 def ov_wrapper(self, *args, **kwargs) -> torch.Tensor:
     input_metadata = kwargs['input_metadata']
-
     flatten_kv_cache = _flattenize_inputs(kwargs['kv_caches'])
-    flatten_kv_cache = [_prepare_data(t) for t in flatten_kv_cache]
 
     inputs = [
         kwargs['input_ids'],
