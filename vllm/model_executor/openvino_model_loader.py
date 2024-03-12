@@ -1,19 +1,18 @@
 """Utilities for selecting and loading models."""
-import contextlib
-import os
 from typing import Optional
 
 import math
 import torch
 import numpy as np
-import torch.nn as nn
 
 from vllm.config import DeviceConfig, ModelConfig
 from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.model_executor.input_metadata import InputMetadata
 from vllm.sequence import SamplerOutput
 from vllm.utils import is_openvino_optimum_intel
 
-def flattenize_inputs(inputs):
+
+def _flattenize_inputs(inputs):
     """
     Helper function for making nested inputs flattens
     """
@@ -22,41 +21,34 @@ def flattenize_inputs(inputs):
         if input_data is None:
             continue
         if isinstance(input_data, (list, tuple)):
-            flatten_inputs.extend(flattenize_inputs(input_data))
+            flatten_inputs.extend(_flattenize_inputs(input_data))
         elif isinstance(input_data, dict):
-            flatten_inputs.extend(flattenize_inputs(list(input_data.values())))
+            flatten_inputs.extend(_flattenize_inputs(list(input_data.values())))
         else:
             flatten_inputs.append(input_data)
     return flatten_inputs
 
 
-def ov_wrapper(self, *args, **kwargs):
-    #print('OV FORWARD WRAPPER')
-    #print(f'model class: {type(args[0])}')
-    #for i, input in enumerate(args[1:]):
-    #    print(f'[{i}]: {type(input)}')
-    #for key, value in kwargs.items():
-    #    print(f'{key}: {type(value)}')
-    #result = args[0]._openvino_patch_orig_forward(*args[1:], **kwargs)
+def _prepare_data(tensor):
+    tensor = np.array(tensor, copy=False)
+    assert tensor.flags["C_CONTIGUOUS"]
+    return tensor
+
+
+def ov_wrapper(self, *args, **kwargs) -> torch.Tensor:
     input_metadata = kwargs['input_metadata']
-    #print(dir(input_metadata))
-    #print(input_metadata.is_prompt, input_metadata.slot_mapping, input_metadata.max_context_len, input_metadata.context_lens, input_metadata.block_tables)
-    def prepare_data(t):
-        t = np.array(t, copy=False)
-        #print(t.__array_interface__['data'][0])
-        assert t.flags["C_CONTIGUOUS"]
-        return t
-    flatten_kv_cache = flattenize_inputs(kwargs['kv_caches'])
-    #total_size = sum([torch.numel(t) for t in flatten_kv_cache])
-    #print(f'kv-cache total size: {total_size}')
-    flatten_kv_cache = [prepare_data(t) for t in flatten_kv_cache]
+
+    flatten_kv_cache = _flattenize_inputs(kwargs['kv_caches'])
+    flatten_kv_cache = [_prepare_data(t) for t in flatten_kv_cache]
+
     inputs = [
         kwargs['input_ids'],
         kwargs['positions'],
         *flatten_kv_cache,
-        input_metadata.is_prompt, input_metadata.slot_mapping
+        input_metadata.is_prompt,
+        input_metadata.slot_mapping
     ]
-    #print('slot_mapping:', input_metadata.slot_mapping)
+
     if input_metadata.max_context_len is not None:
         # available from the second iteration
         inputs.append(input_metadata.max_context_len)
@@ -64,13 +56,14 @@ def ov_wrapper(self, *args, **kwargs):
         inputs.append(input_metadata.block_tables)
     else:
         inputs.append(np.array(0, dtype=np.int32))   # for optimum-based models this parameter can be used even on the first iteration
-    #for input in inputs:
-    #    print(f'{input.dtype} wiht shape {input.shape}' if isinstance(input, torch.Tensor) else type(input))
-    result = self.ov_request.infer(inputs, share_inputs=True, share_outputs=False)
-    #print(f'result: {type(result)}')
-    return torch.from_numpy(result[0])
 
-def patch_stateful_model(model, factory):
+    outputs = self._ov_request.infer(inputs, share_inputs=True, share_outputs=False)
+    return torch.from_numpy(outputs[0])
+
+
+def patch_stateful_model(
+    model: torch.nn.Module,
+    factory):
     print('TRANSFORMING OPTIMUM-INTEL MODEL TO vLLM COMPATIBLE FORM')
     from openvino.runtime.passes import Manager, MatcherPass, WrapType, Matcher, AnyInput, Or
     from openvino.runtime import opset13
@@ -279,6 +272,149 @@ def patch_stateful_model(model, factory):
     model.add_parameters(model_remaining_params)
     print('PARAMETERS ARE REORGANIZED, THE STATE (IF EXISTS) IS REMOVED')
 
+def _patch_model_with_openvino(
+        pt_model: torch.nn.Module,
+        model_config: ModelConfig):
+    print(' ============= PATCHING MODEL =============')
+    from vllm.model_executor.layers.attention.attention import Attention
+    from openvino.frontend.pytorch import ModuleExtension
+    from openvino import Core, convert_model, Type, PartialShape
+    from functools import partial
+
+    # Avoid usage of vllm._C.ops
+
+    from vllm.model_executor.layers.activation import SiluAndMul, NewGELU, FastGELU
+    from vllm.model_executor.layers.layernorm import RMSNorm
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+
+    SiluAndMul.forward = SiluAndMul._forward
+    NewGELU.forward = NewGELU._forward
+    FastGELU.forward = FastGELU._forward
+    RMSNorm.forward = RMSNorm._forward
+    RotaryEmbedding.forward = RotaryEmbedding._forward
+
+    # Prepare example inputs
+
+    kv_cache_dtype = torch.float32
+    num_heads = pt_model.config.num_attention_heads
+    num_kv_heads = num_heads
+    head_size = pt_model.config.hidden_size // num_kv_heads
+    num_hidden_layers = model_config.hf_config.num_hidden_layers
+
+    _PAD_SLOT_ID = -1
+    _EXAMPLE_BLOCK_SIZE = 8
+    _EXAMPLE_NUM_BLOCKS = 256
+    _X = kv_cache_dtype.itemsize
+
+    _BATCH_SIZES_TO_CAPTURE = [2]
+    max_batch_size = max(_BATCH_SIZES_TO_CAPTURE)
+    max_context_len = (
+                model_config.max_context_len_to_capture
+                if model_config is not None else 0)
+    max_num_blocks = (max_context_len + _EXAMPLE_BLOCK_SIZE - 1) // _EXAMPLE_BLOCK_SIZE
+
+    slot_mapping = torch.empty(max_batch_size, 1, dtype=torch.long)
+    slot_mapping.fill_(_PAD_SLOT_ID)
+    context_lens = torch.ones(max_batch_size, dtype=torch.int32)
+    prompt_lens = torch.ones(max_batch_size, dtype=torch.long)
+    start_loc = torch.ones(max_batch_size, dtype=torch.long)
+    block_tables = torch.ones((max_batch_size, max_num_blocks), dtype=torch.int32)
+
+    kv_cache = [(torch.ones((_EXAMPLE_NUM_BLOCKS, num_kv_heads, head_size // _X, _EXAMPLE_BLOCK_SIZE, _X), dtype=kv_cache_dtype),
+                 torch.ones((_EXAMPLE_NUM_BLOCKS, num_kv_heads, head_size, _EXAMPLE_BLOCK_SIZE), dtype=kv_cache_dtype))] * num_hidden_layers
+
+    input_meta = {
+        "is_prompt": torch.tensor(False),
+        "slot_mapping": slot_mapping,
+        "max_seq_len": torch.tensor(256),
+        "max_context_len": torch.tensor(max_context_len),
+        "context_lens": context_lens,
+        "block_tables": block_tables,
+        "prompt_lens": prompt_lens,
+        "start_loc": start_loc,
+        "use_cuda_graph": torch.tensor(False),
+        "kv_cache_dtype": torch.tensor(False), # TODO: openvino.tools.ovc.error.Error: Unexpected type of example_input. Supported types torch.Tensor, np.array or ov.Tensor. Got <class 'str'>
+    }
+
+    example_input = (torch.ones((1, 1), dtype=torch.long), torch.range(0, 10, dtype=torch.long).unsqueeze(0)[:, -1:], tuple(kv_cache), input_meta)
+
+    class ModelWrapper(torch.nn.Module):
+        '''
+        Model wrapper to convert a map of aatributes to InputMetadata struct
+        '''
+
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+
+        def forward(self, input_ids, position_ids, kv_cache, meta_dict):
+            input_meta = InputMetadata(**meta_dict)
+            return self.model(input_ids, position_ids, kv_cache, input_meta)
+
+    def wrapper(module, target_op, *args, **kwargs):
+        # this function will replace entier PageAttention module
+        # target_op is PageAttentionExtension, the order of arguments below should match the extension signature
+        return target_op(
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            args[4],
+            args[5].is_prompt,
+            args[5].slot_mapping,
+            args[5].max_context_len,
+            args[5].context_lens,
+            args[5].block_tables,
+            torch.tensor(module.backend.scale),  # wrap in a tensor, otherwise it will not appear in the trace
+            torch.tensor(module.backend.alibi_slopes if module.backend.alibi_slopes is not None else [], dtype=torch.float32),  # alibi_slopes
+            torch.tensor(module.backend.sliding_window if module.backend.sliding_window is not None else 0, dtype=torch.int32)  # sliding_window
+        )
+
+    with torch.no_grad():
+        print('>>>>>>>>>>>>> CONVERTING OV MODEL')
+        ov_model =  convert_model(
+            ModelWrapper(pt_model),
+            example_input=example_input,
+            extension=[
+                ModuleExtension(
+                    Attention,
+                    target_op='PagedAttentionExtension',
+                    evaluate=lambda module, *args, **kwargs: args[0],  # need this because PagedAttention module fails in torch.jit.trace
+                    convert=wrapper
+                ),
+                "libuser_ov_extensions.so"
+            ]
+        )
+
+        ov_dtype_maping = {
+            torch.bool: Type.boolean,
+            torch.float32: Type.f32,
+            torch.float16: Type.f16,
+            torch.bfloat16: Type.bf16,
+            torch.int32: Type.i32,
+            torch.int64: Type.i64
+        }
+
+        for example_input_data, input_tensor in zip(_flattenize_inputs(example_input), ov_model.inputs):
+            if input_tensor.element_type.is_dynamic():
+                input_tensor.get_node().set_element_type(ov_dtype_maping[example_input_data.dtype])
+            if input_tensor.partial_shape.rank.is_dynamic:
+                input_tensor.get_node().set_partial_shape(PartialShape([-1]*example_input_data.ndim))
+
+        for out_name, out in zip(["logits"], ov_model.outputs):
+            out.get_tensor().set_names({out_name})
+        ov_model.validate_nodes_and_infer_types()
+        print('>>>>>>>>>>>>> OV MODEL CONVERTED')
+
+    core = Core()
+    ov_compiled_model = core.compile_model(ov_model, "CPU")
+    ov_request = ov_compiled_model.create_infer_request()
+
+    pt_model._ov_request = ov_request
+    pt_model._openvino_patch_orig_forward = pt_model.forward
+    pt_model.forward = partial(ov_wrapper, pt_model)
+
+
 def ov_sample(
     self,
     hidden_states: torch.Tensor,
@@ -286,12 +422,9 @@ def ov_sample(
 ) -> Optional[SamplerOutput]:
     return self.sampler(None, hidden_states, sampling_metadata)
 
-def get_model(model_config: ModelConfig, device_config: DeviceConfig,
-              **kwargs) -> nn.Module:
-    if not is_openvino_optimum_intel():
-        from vllm.model_executor.model_loader import get_model
-        return get_model(model_config, device_config, **kwargs)
-
+def get_model(model_config: ModelConfig,
+              device_config: DeviceConfig,
+              **kwargs) -> torch.nn.Module:
     lora_config = kwargs.get("lora_config", None)
     if lora_config:
         raise ValueError(
@@ -300,30 +433,32 @@ def get_model(model_config: ModelConfig, device_config: DeviceConfig,
             "be added in the future. If this is important to you, "
             "please open an issue on github.")
 
-    import openvino as ov
-    from optimum.intel import OVModelForCausalLM
-    pt_model = OVModelForCausalLM.from_pretrained(model_config.model, export=True, compile=False, load_in_8bit=False, trust_remote_code=True) # need stateful because it also enables SDPA
-    if not hasattr(pt_model, 'ov_node_factory'):
-        from openvino.runtime.utils.node_factory import NodeFactory
-        # Keep factory to destroy it in a particular moment when all other objects referencing custom nodes are destoyed
-        pt_model.ov_node_factory = NodeFactory()
-        pt_model.ov_node_factory.add_extension('libuser_ov_extensions.so')
-    patch_stateful_model(pt_model.model, pt_model.ov_node_factory)
-    #ov.serialize(self.model.model, 'vllm_openvino_model.xml')
-    core = ov.Core()
-    ov_compiled = core.compile_model(pt_model.model, "CPU")
-    pt_model.ov_request = ov_compiled.create_infer_request()
+    pt_model = None
 
-    from functools import partial
-    pt_model._openvino_patch_orig_forward = pt_model.forward
-    pt_model.forward = partial(ov_wrapper, pt_model)
+    if is_openvino_optimum_intel() and False:
+        import openvino as ov
+        from optimum.intel import OVModelForCausalLM
+        pt_model = OVModelForCausalLM.from_pretrained(model_config.model, export=True, compile=False, load_in_8bit=False, trust_remote_code=True) # need stateful because it also enables SDPA
+        if not hasattr(pt_model, 'ov_node_factory'):
+            from openvino.runtime.utils.node_factory import NodeFactory
+            # Keep factory to destroy it in a particular moment when all other objects referencing custom nodes are destoyed
+            pt_model.ov_node_factory = NodeFactory()
+            pt_model.ov_node_factory.add_extension('libuser_ov_extensions.so')
+        patch_stateful_model(pt_model.model, pt_model.ov_node_factory)
+        core = ov.Core()
+        ov_compiled = core.compile_model(pt_model.model, "CPU")
+        pt_model.ov_request = ov_compiled.create_infer_request()
 
-    # self.vllm_model = get_model(self.model_config)
-    # def sample_wrapper(*args, **kwargs):
-    #     return self.vllm_model.sample(*args, hidden_states=None, **kwargs)
-    # self.model.sample = sample_wrapper
-    from vllm.model_executor.layers.sampler import Sampler
-    pt_model.sampler = Sampler(model_config.hf_config.vocab_size)
-    pt_model.sample = partial(ov_sample, pt_model)
+        from functools import partial
+        pt_model._openvino_patch_orig_forward = pt_model.forward
+        pt_model.forward = partial(ov_wrapper, pt_model)
+
+        from vllm.model_executor.layers.sampler import Sampler
+        pt_model.sampler = Sampler(model_config.hf_config.vocab_size)
+        pt_model.sample = partial(ov_sample, pt_model)
+    else:
+        from vllm.model_executor.model_loader import get_model
+        pt_model = get_model(model_config, device_config, **kwargs)
+        _patch_model_with_openvino(pt_model, model_config)
 
     return pt_model
