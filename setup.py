@@ -45,6 +45,15 @@ def _is_cuda() -> bool:
     return (torch.version.cuda is not None) and not _is_neuron()
 
 
+def _is_openvino() -> bool:
+    openvino_available = True
+    try:
+        import openvino
+    except ImportError:
+        openvino_available = False
+    openvino_available = os.getenv("VLLM_OPENVINO", "0") == "1"
+    return openvino_available
+
 # Compiler flags.
 CXX_FLAGS = ["-g", "-O2", "-std=c++17"]
 # TODO(woosuk): Should we use -O3?
@@ -113,6 +122,11 @@ def get_neuronxcc_version():
     else:
         raise RuntimeError("Could not find HIP version in the output")
 
+
+def get_openvino_version():
+    # import openvino
+    # return openvino.__version__[:8]
+    return "2024.1.0"
 
 def get_nvcc_cuda_version(cuda_dir: str) -> Version:
     """Get the CUDA version from nvcc.
@@ -357,7 +371,7 @@ if _is_cuda():
             },
         ))
 
-if not _is_neuron():
+if _is_cuda() or _is_hip():
     vllm_extension = CUDAExtension(
         name="vllm._C",
         sources=vllm_extension_sources,
@@ -402,6 +416,10 @@ def get_vllm_version() -> str:
         if neuron_version != MAIN_CUDA_VERSION:
             neuron_version_str = neuron_version.replace(".", "")[:3]
             version += f"+neuron{neuron_version_str}"
+    elif _is_openvino():
+        # Get the OpenVINO version
+        openvino_version = get_openvino_version()
+        version += f"+openvino{openvino_version}"
     else:
         cuda_version = str(nvcc_cuda_version)
         if cuda_version != MAIN_CUDA_VERSION:
@@ -427,6 +445,9 @@ def get_requirements() -> List[str]:
             requirements = f.read().strip().split("\n")
     elif _is_neuron():
         with open(get_path("requirements-neuron.txt")) as f:
+            requirements = f.read().strip().split("\n")
+    elif _is_openvino():
+        with open(get_path("requirements-openvino.txt")) as f:
             requirements = f.read().strip().split("\n")
     else:
         with open(get_path("requirements.txt")) as f:
