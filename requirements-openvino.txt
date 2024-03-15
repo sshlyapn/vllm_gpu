@@ -7,4 +7,4 @@ pydantic >= 2.0  # Required for OpenAI server.
 prometheus_client >= 0.18.0
 torch >= 2.1.2
 transformers >= 4.38.0  # Required for Gemma.
-openvino==2024.1.0
+# openvino==2024.1.0

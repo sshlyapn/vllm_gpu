@@ -18,6 +18,7 @@ from vllm.utils import (get_ip, get_open_port, get_distributed_init_method,
 from vllm.sampling_params import SamplingParams
 
 import openvino as ov
+import os
 
 logger = init_logger(__name__)
 
@@ -48,12 +49,14 @@ class OpenVINOCacheEngine:
         cache_config: CacheConfig,
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
-        device_config: DeviceConfig
+        device_config: DeviceConfig,
+        ov_core: ov.Core
     ) -> None:
         self.cache_config = cache_config
         self.model_config = model_config
         self.parallel_config = parallel_config
         self.device_config = device_config
+        self.ov_core = ov_core
 
         self.head_size = model_config.get_head_size()
         self.num_layers = model_config.get_num_layers(parallel_config)
@@ -76,6 +79,13 @@ class OpenVINOCacheEngine:
         # TODO: ilavreno: we can insert per-device KV cache shapes configurations
         # which are more optimal for plugins representations
         element_size = self.cache_dtype.get_size()
+
+        # import os
+        # ov_device = os.getenv("OV_DEVICE", "GPU.0")
+        # if ov_device != "CPU":
+        #     print("KV cache element size is", element_size, "force to 2")
+        #     element_size = 2
+
         x = 16 // element_size
         return (
             self.num_heads,
@@ -99,10 +109,15 @@ class OpenVINOCacheEngine:
         gpu_cache: List[OpenVINOKVCache] = []
         key_block_shape = (self.num_gpu_blocks, *self.get_key_block_shape())
         value_block_shape = (self.num_gpu_blocks, *self.get_value_block_shape())
-        remote_context = ov.Core().get_default_context("GPU")
+
+        ov_device = os.getenv('OV_DEVICE', "GPU.0")
+        if ov_device == "CPU":
+            raise RuntimeError("Trying to allocate gpu tensors using CPU device")
+
+        remote_context = self.ov_core.get_default_context(ov_device)
         for _ in range(self.num_layers):
-            key_blocks = remote_context.create_tensor(self.cache_dtype, key_block_shape)
-            value_blocks = remote_context.create_tensor(self.cache_dtype, value_block_shape)
+            key_blocks = remote_context.create_tensor(self.cache_dtype, ov.Shape(key_block_shape), {})
+            value_blocks = remote_context.create_tensor(self.cache_dtype, ov.Shape(value_block_shape), {})
             gpu_cache.append((key_blocks, value_blocks))
         return gpu_cache
 
@@ -149,7 +164,14 @@ class OpenVINOCacheEngine:
             cache_dtype = model_config.dtype
         else:
             cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
+
         ov_cache_dtype = TORCH_DTYPE_TO_OPENVINO_DTYPE[cache_dtype]
+
+        ov_device = os.getenv("OV_DEVICE", "GPU.0")
+        if ov_device != "CPU":
+            print("Force KV cache data type to FP16")
+            ov_cache_dtype = ov.Type.f16
+
         return ov_cache_dtype
 
     @staticmethod
@@ -247,7 +269,9 @@ class OpenVINOWorker:
 
         # TODO: ilavreno: currently we cannot specify GPU as device
         # so, the code below is dead, but we can change the condition and test it
-        if self.device_config.device.type == 'gpu':
+
+        ov_device = os.getenv('OV_DEVICE', "GPU.0")
+        if ov_device != "CPU":
             # Execute a forward pass with dummy inputs to profile the memory usage
             # of the model.
             def model_profile_run():
@@ -292,14 +316,16 @@ class OpenVINOWorker:
                 # compute max_num_batched_tokens tokens
                 del profiling_cache_engine
 
-            model_profile_run()
+            # model_profile_run()
 
             # Calculate the number of blocks that can be allocated with the
             # profiled peak memory.
-            core = ov.Core()
-            free_gpu_memory, total_gpu_memory = core.get_property("GPU", ov.intel_gpu_hint.available_device_mem), \
-                                                core.get_property("GPU", ov.intel_gpu_hint.device_total_mem_size)
-            peak_memory = self.init_gpu_memory - free_gpu_memory
+
+            total_gpu_memory = self.model_runner.model.device_total_mem_size / 2 if ov_device == "GPU.0" else \
+                               self.model_runner.model.device_total_mem_size
+            peak_memory = self.model_runner.model.memory_statistics["usm_device"] * 2 # suppose doubled of compiled model size
+
+            ctx = self.model_runner.model.ov_core.get_default_context(ov_device)
 
             cache_block_size = self.get_cache_block_size_bytes(
                 block_size, cache_dtype)
@@ -314,7 +340,8 @@ class OpenVINOWorker:
     def init_cache_engine(self, cache_config: CacheConfig) -> None:
         self.cache_config = cache_config
         self.cache_engine = OpenVINOCacheEngine(self.cache_config, self.model_config,
-                                                self.parallel_config, self.device_config)
+                                                self.parallel_config, self.device_config,
+                                                self.model_runner.model.ov_core)
         self.gpu_cache = self.cache_engine.gpu_cache
         self.cpu_cache = self.cache_engine.cpu_cache
         self.model_runner.set_block_size(self.cache_engine.block_size)
@@ -386,7 +413,8 @@ class OpenVINOWorker:
         """
         return OpenVINOCacheEngine.get_cache_block_size(block_size, cache_dtype,
                                                         self.model_config,
-                                                        self.parallel_config)
+                                                        self.parallel_config,
+                                                        self.device_config)
 
     def _init_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
