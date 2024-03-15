@@ -61,7 +61,7 @@ def patch_stateful_model(
     from openvino.runtime.utils import replace_node
 
     #model.remove_parameter(model.input('beam_idx').get_node())
-    max_context_len = opset13.parameter(shape=[], dtype=np.int64, name='max_context_len')  # max_context_len
+    max_context_len = opset13.parameter(shape=[], dtype=np.int32, name='max_context_len')  # max_context_len
     model_remaining_params = [
         opset13.parameter(shape=[], dtype=bool, name='is_prompt'),  # is_prompt
         opset13.parameter(shape=[-1, -1], dtype=np.int64, name='slot_mapping'),  # slot mapping
@@ -126,8 +126,13 @@ def patch_stateful_model(
                 real_v = mapping[v_current]
                 hidden_shape = real_q.get_partial_shape()
                 hidden_dim = hidden_shape[hidden_shape.rank.get_length() - 1].get_length()  # TODO: What if it is a dynamic? Need to insert a ShapeOf sub-graph instead
-                k_parameter = opset13.parameter(shape=[-1, -1, -1, -1, -1], dtype=np.float32)
-                v_parameter = opset13.parameter(shape=[-1, -1, -1, -1], dtype=np.float32)
+
+                import os
+                ov_device = os.getenv('OV_DEVICE', "GPU.0")
+                kv_cache_dt = np.float32 if ov_device == "CPU" else np.float16
+
+                k_parameter = opset13.parameter(shape=[-1, -1, -1, -1, -1], dtype=kv_cache_dt)
+                v_parameter = opset13.parameter(shape=[-1, -1, -1, -1], dtype=kv_cache_dt)
                 kv_parameters.append(k_parameter)
                 kv_parameters.append(v_parameter)
                 # TODO: The rank 4 is used in the following code, but it is not guaranteed for all models, adopt to other ranks.
@@ -398,7 +403,10 @@ def _patch_model_with_openvino(
         print('>>>>>>>>>>>>> OV MODEL CONVERTED')
 
     core = Core()
-    ov_compiled_model = core.compile_model(ov_model, "CPU")
+
+    import os
+    ov_device = os.getenv('OV_DEVICE', "GPU.0")
+    ov_compiled_model = core.compile_model(ov_model, ov_device)
     ov_request = ov_compiled_model.create_infer_request()
 
     pt_model._ov_request = ov_request
@@ -426,10 +434,17 @@ def get_model(model_config: ModelConfig,
 
     pt_model = None
 
-    if is_openvino_optimum_intel() and False:
+    if is_openvino_optimum_intel():
+        print("Use OpenVINO optimum")
         import openvino as ov
         from optimum.intel import OVModelForCausalLM
-        pt_model = OVModelForCausalLM.from_pretrained(model_config.model, export=True, compile=False, load_in_8bit=False, trust_remote_code=True) # need stateful because it also enables SDPA
+
+        model_path = "vllm/mistral-7B-v0.1-stateful/pytorch/dldt/compressed_weights/OV_FP16-INT4_SYM"
+        print("Run model: ", model_path)
+        pt_model = OVModelForCausalLM.from_pretrained(model_path, export=False,
+                                                      compile=False, load_in_4bit=True, trust_remote_code=True) # need stateful because it also enables SDPA
+
+        # pt_model = OVModelForCausalLM.from_pretrained(model_config.model, export=True, compile=False, load_in_8bit=False, trust_remote_code=True) # need stateful because it also enables SDPA
         if not hasattr(pt_model, 'ov_node_factory'):
             from openvino.runtime.utils.node_factory import NodeFactory
             # Keep factory to destroy it in a particular moment when all other objects referencing custom nodes are destoyed
@@ -437,8 +452,11 @@ def get_model(model_config: ModelConfig,
             pt_model.ov_node_factory.add_extension('libuser_ov_extensions.so')
         patch_stateful_model(pt_model.model, pt_model.ov_node_factory)
         core = ov.Core()
-        ov_compiled = core.compile_model(pt_model.model, "CPU")
-        pt_model.ov_request = ov_compiled.create_infer_request()
+
+        import os
+        ov_device = os.getenv('OV_DEVICE', "GPU.0")
+        ov_compiled = core.compile_model(pt_model.model, ov_device)
+        pt_model._ov_request = ov_compiled.create_infer_request()
 
         from functools import partial
         pt_model._openvino_patch_orig_forward = pt_model.forward
@@ -447,6 +465,12 @@ def get_model(model_config: ModelConfig,
         from vllm.model_executor.layers.sampler import Sampler
         pt_model.sampler = Sampler(model_config.hf_config.vocab_size)
         pt_model.sample = partial(ov_sample, pt_model)
+
+        import openvino.properties.device as device
+
+        print("Used OV device: ", core.get_property(ov_device, device.full_name))
+
+        pt_model.ov_core = core
     else:
         from vllm.model_executor.model_loader import get_model
         pt_model = get_model(model_config, device_config, **kwargs)
