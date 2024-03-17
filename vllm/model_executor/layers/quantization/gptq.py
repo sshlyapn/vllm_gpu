@@ -6,7 +6,6 @@ from fractions import Fraction
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm._C import ops
 from vllm.model_executor.layers.linear import (LinearMethodBase,
                                                set_weight_attrs)
 from vllm.model_executor.layers.quantization.base_config import (
@@ -191,6 +190,7 @@ class GPTQLinearMethod(LinearMethodBase):
                       weights: Dict[str, Any],
                       x: torch.Tensor,
                       bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        from vllm._C import ops
         qweight = weights["qweight"]
         out_shape = x.shape[:-1] + (qweight.shape[-1], )
         reshaped_x = x.reshape(-1, x.shape[-1])

@@ -2,11 +2,7 @@ from typing import List, Optional
 
 import torch
 
-from vllm._C import cache_ops
-from vllm._C import ops
 from vllm.model_executor.input_metadata import InputMetadata
-# from vllm.model_executor.layers.attention.ops.prefix_prefill import (
-#     context_attention_fwd)
 
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
 _PARTITION_SIZE = 512
@@ -26,6 +22,7 @@ class PagedAttentionImpl:
         value_cache: torch.Tensor,
         input_metadata: InputMetadata,
     ) -> None:
+        from vllm._C import cache_ops
         cache_ops.reshape_and_cache(
             key,
             value,
@@ -45,6 +42,7 @@ class PagedAttentionImpl:
         scale: float,
         alibi_slopes: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        from vllm._C import ops
         output = torch.empty_like(query)
 
         block_size = value_cache.shape[3]
@@ -121,6 +119,7 @@ class PagedAttentionImpl:
         alibi_slopes: Optional[torch.Tensor],
     ) -> torch.Tensor:
         output = torch.empty_like(query)
+        from vllm.model_executor.layers.attention.ops.prefix_prefill import context_attention_fwd
         context_attention_fwd(
             query,
             key,

@@ -3,7 +3,6 @@ from typing import Any, Dict, List, Optional
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm._C import ops
 from vllm.model_executor.layers.linear import LinearMethodBase, set_weight_attrs
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
@@ -208,6 +207,7 @@ class MarlinLinearMethod(LinearMethodBase):
         size_k = x_2d.shape[1]
         size_n = scales.shape[1]
 
+        from vllm._C import ops
         output_2d = ops.marlin_gemm(x_2d, qweight, scales, workspace, size_m,
                                     size_n, size_k)
 
