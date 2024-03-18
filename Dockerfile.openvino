@@ -1,0 +1,61 @@
+# The vLLM Dockerfile is used to construct vLLM image that can be directly used
+# to run the OpenAI compatible server.
+
+#################### BASE BUILD IMAGE ####################
+FROM ubuntu:22.04 AS dev
+
+RUN apt-get update -y && \
+    apt-get install -y python3-pip git
+WORKDIR /workspace
+
+# build and install OpenVINO
+RUN git clone --recurse-submodules -b pytorch_module_extension https://github.com/slyalin/openvino.git
+RUN /workspace/openvino/install_build_dependencies.sh
+RUN cmake -DCPACK_GENERATOR=DEB -DENABLE_PYTHON=ON -DENABLE_PYTHON_PACKAGING=ON -DENABLE_CPPLINT=OFF \
+    -DENABLE_INTEL_GPU=OFF -DENABLE_TEMPLATE=OFF -DENABLE_AUTO=OFF -DENABLE_HETERO=OFF -DENABLE_AUTO_BATCH=OFF \
+    -DENABLE_OV_TF_FRONTEND=OFF -DENABLE_OV_ONNX_FRONTEND=OFF -DENABLE_OV_TF_LITE_FRONTEND=OFF -DENABLE_OV_PADDLE_FRONTEND=OFF \
+    -S /workspace/openvino -B /workspace/openvino_build
+RUN python3 -m pip install -r /workspace/openvino/src/bindings/python/wheel/requirements-dev.txt
+RUN cmake --build /workspace/openvino_build --parallel 8
+RUN cmake -P /workspace/openvino_build/cmake_install.cmake
+
+# build and install OpenVINO Contrib with PagedAttention
+RUN git clone --branch paged-attention https://github.com/ilya-lavrenov/openvino_contrib.git
+RUN cmake -DCUSTOM_OPERATIONS=paged_attention -DCMAKE_INSTALL_PREFIX=/usr \
+    -S /workspace/openvino_contrib/modules/custom_operations/ -B /workspace/paged_attention_build/
+RUN cmake --build /workspace/paged_attention_build/ --parallel 8
+RUN cmake -P /workspace/openvino_build/cmake_install.cmake
+
+# Install OpenVINO tokenizers
+RUN PIP_PRE=1 PIP_EXTRA_INDEX_URL="https://storage.openvinotoolkit.org/simple/wheels/nightly" python3 -m pip install openvino-tokenizers
+#################### BASE BUILD IMAGE ####################
+
+
+#################### EXTENSION BUILD IMAGE ####################
+FROM dev AS build
+
+COPY requirements-build.txt /workspace/vllm/
+COPY requirements-openvino.txt /workspace/vllm/
+
+# install build dependencies
+RUN PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu" python3 -m pip install -r /workspace/vllm/requirements-build.txt
+# install runtime dependencies
+RUN PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu" python3 -m pip install -r /workspace/vllm/requirements-openvino.txt
+
+COPY vllm/ /workspace/vllm/vllm
+COPY setup.py /workspace/vllm/
+
+RUN cmake -P /workspace/paged_attention_build/cmake_install.cmake
+RUN python3 -m pip install --no-build-isolation /workspace/vllm/
+#################### EXTENSION Build IMAGE ####################
+
+
+#################### OPENAI API SERVER ####################
+# openai api server alternative
+FROM build AS vllm-openai
+# install additional dependencies for openai api server
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install accelerate
+
+ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+#################### OPENAI API SERVER ####################
