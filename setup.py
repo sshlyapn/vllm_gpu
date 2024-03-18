@@ -51,7 +51,6 @@ def _is_openvino() -> bool:
         import openvino
     except ImportError:
         openvino_available = False
-    openvino_available = os.getenv("VLLM_OPENVINO", "0") == "1"
     return openvino_available
 
 # Compiler flags.
@@ -124,9 +123,8 @@ def get_neuronxcc_version():
 
 
 def get_openvino_version():
-    # import openvino
-    # return openvino.__version__[:8]
-    return "2024.1.0"
+    import openvino
+    return openvino.__version__[:8]
 
 def get_nvcc_cuda_version(cuda_dir: str) -> Version:
     """Get the CUDA version from nvcc.
