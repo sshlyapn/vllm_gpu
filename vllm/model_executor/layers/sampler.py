@@ -64,6 +64,7 @@ class Sampler(nn.Module):
         if self.logits_as_hidden_states:
             logits = hidden_states
             if is_openvino_optimum_intel():
+                # TODO: Fuse this step to the model inference
                 logits = _prune_hidden_states(logits, sampling_metadata)
         else:
             hidden_states = _prune_hidden_states(hidden_states,

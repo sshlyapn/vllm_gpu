@@ -419,6 +419,21 @@ class OpenVINOWorker:
         ensure_model_parallel_initialized(self.parallel_config.tensor_parallel_size,
                                           self.parallel_config.pipeline_parallel_size)
 
+    def __del__(self):
+        # TODO: Better to put this code in a wrapper around optimum-based model inside OpenVINO model loader
+        #       but it requires more coding because it should be a full-functional substitution of torch.nn.Module.
+        #       The current solution to put the code here is not robust enough: self.model_runner is not our class instance
+        #       and it can be modified in a way that model is no longer kept as self.model_runner.model attribute.
+        if not (hasattr(self.model_runner, 'model') and hasattr(self.model_runner.model, 'model')):
+            return
+        pt_model = self.model_runner.model
+        if hasattr(pt_model, 'ov_node_factory'):
+            del pt_model._ov_request
+            del pt_model.model
+            if gc: # when app is being destroyed the module may not be available
+                gc.collect()
+            del pt_model.ov_node_factory
+
 
 class OpenVINOExecutor(ExecutorBase):
 
