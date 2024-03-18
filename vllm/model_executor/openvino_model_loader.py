@@ -1,6 +1,6 @@
 """Utilities for selecting and loading models."""
+from functools import partial
 from typing import Optional
-
 import math
 import torch
 import numpy as np
@@ -10,6 +10,8 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.sequence import SamplerOutput
 from vllm.utils import is_openvino_optimum_intel
+
+import openvino as ov
 
 
 def _flattenize_inputs(inputs):
@@ -53,7 +55,7 @@ def ov_wrapper(self, *args, **kwargs) -> torch.Tensor:
 
 
 def patch_stateful_model(
-    model: torch.nn.Module,
+    model: ov.Model,
     factory):
     print('TRANSFORMING OPTIMUM-INTEL MODEL TO vLLM COMPATIBLE FORM')
     from openvino.runtime.passes import Manager, MatcherPass, WrapType, Matcher, AnyInput, Or
@@ -194,7 +196,14 @@ def patch_stateful_model(
             seq = WrapType("opset13.Gather", [kv_shape, AnyInput(), AnyInput()])
 
             def callback(m: Matcher) -> bool:
-                replace_node(m.get_match_root(), max_context_len)
+                gather = m.get_match_root()
+                target_type = gather.get_output_element_type(0)
+                if max_context_len.get_output_element_type(0) != target_type:
+                    print(f'Converting {max_context_len.get_output_element_type(0)} of max_context_len to {target_type}')
+                    replacement = opset13.convert(max_context_len, target_type)
+                else:
+                    replacement = max_context_len
+                replace_node(gather, replacement)
                 print("DETECTED PATTERN FOR max_sequence_length, CONNECTED TO A DEDICATED PARAMETER")
                 return True
 
@@ -270,7 +279,6 @@ def _patch_model_with_openvino(
     from vllm.model_executor.layers.attention.attention import Attention
     from openvino.frontend.pytorch import ModuleExtension
     from openvino import Core, convert_model, Type, PartialShape
-    from functools import partial
 
     # Avoid usage of vllm._C.ops
 
@@ -426,7 +434,7 @@ def get_model(model_config: ModelConfig,
 
     pt_model = None
 
-    if is_openvino_optimum_intel() and False:
+    if is_openvino_optimum_intel():
         import openvino as ov
         from optimum.intel import OVModelForCausalLM
         pt_model = OVModelForCausalLM.from_pretrained(model_config.model, export=True, compile=False, load_in_8bit=False, trust_remote_code=True) # need stateful because it also enables SDPA
@@ -438,9 +446,8 @@ def get_model(model_config: ModelConfig,
         patch_stateful_model(pt_model.model, pt_model.ov_node_factory)
         core = ov.Core()
         ov_compiled = core.compile_model(pt_model.model, "CPU")
-        pt_model.ov_request = ov_compiled.create_infer_request()
+        pt_model._ov_request = ov_compiled.create_infer_request()
 
-        from functools import partial
         pt_model._openvino_patch_orig_forward = pt_model.forward
         pt_model.forward = partial(ov_wrapper, pt_model)
 
