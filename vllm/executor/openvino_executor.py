@@ -60,6 +60,10 @@ class OpenVINOCacheEngine:
         self.num_layers = model_config.get_num_layers(parallel_config)
         self.num_heads = model_config.get_num_kv_heads(parallel_config)
 
+        if device_config.device.type == "cpu":
+            if cache_config.block_size != 1:
+                print(f"Warning: CPU only support block_size = 1, current is {cache_config.block_size}, forced to 1.")
+                cache_config.block_size = 1
         self.block_size = cache_config.block_size
         self.num_gpu_blocks = cache_config.num_gpu_blocks
         self.num_cpu_blocks = cache_config.num_cpu_blocks
@@ -463,12 +467,12 @@ class OpenVINOExecutor(ExecutorBase):
         self.device_config = device_config
 
         # Instantiate the worker and load the model to OpenVINO device.
-        self._init_worker(OpenVINOCacheEngine.get_cache_dtype(cache_config.cache_dtype, model_config, device_config))
+        self._init_worker()
 
         # Profile the memory usage and initialize the cache.
         self._init_cache()
 
-    def _init_worker(self, cache_dtype):
+    def _init_worker(self):
         assert self.parallel_config.world_size == 1, (
             "OpenVINO worker only supports single inference device.")
 
@@ -478,7 +482,9 @@ class OpenVINOExecutor(ExecutorBase):
             self.scheduler_config,
             self.device_config,
             lora_config=self.lora_config,
-            kv_cache_dtype=cache_dtype,
+            kv_cache_dtype=OpenVINOCacheEngine.get_cache_dtype(self.cache_config.cache_dtype,
+                                                               self.model_config,
+                                                               self.device_config)
         )
         self.driver_worker.init_model()
         self.driver_worker.load_model()

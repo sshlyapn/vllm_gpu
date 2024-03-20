@@ -302,8 +302,6 @@ class EngineArgs:
     ) -> Tuple[ModelConfig, CacheConfig, ParallelConfig, SchedulerConfig,
                DeviceConfig, Optional[LoRAConfig]]:
         device_config = DeviceConfig(self.device)
-        if device_config.device_type == "openvino" and device_config.device.type == "cpu":
-            self.block_size = 1
         model_config = ModelConfig(
             self.model, self.tokenizer, self.tokenizer_mode,
             self.trust_remote_code, self.download_dir, self.load_format,
