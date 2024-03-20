@@ -18,6 +18,7 @@ from vllm.utils import (get_ip, get_open_port, get_distributed_init_method,
 from vllm.sampling_params import SamplingParams
 
 import openvino as ov
+import openvino.properties.hint as hints
 
 logger = init_logger(__name__)
 
@@ -146,7 +147,15 @@ class OpenVINOCacheEngine:
         # probably, we need to force OpenVINO kv cache data types per device and assert
         # if user specified a different value
         if cache_dtype == "auto":
-            cache_dtype = model_config.dtype
+            if device_config.device.type == "cpu":
+                core = ov.Core()
+                inference_precision = core.get_property("CPU", hints.inference_precision)
+                if inference_precision == ov.Type.bf16:
+                    cache_dtype = torch.bfloat16
+                else:
+                    cache_dtype = torch.float16
+            else:
+                cache_dtype = model_config.dtype
         else:
             cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
         ov_cache_dtype = TORCH_DTYPE_TO_OPENVINO_DTYPE[cache_dtype]
@@ -454,12 +463,12 @@ class OpenVINOExecutor(ExecutorBase):
         self.device_config = device_config
 
         # Instantiate the worker and load the model to OpenVINO device.
-        self._init_worker()
+        self._init_worker(OpenVINOCacheEngine.get_cache_dtype(cache_config.cache_dtype, model_config, device_config))
 
         # Profile the memory usage and initialize the cache.
         self._init_cache()
 
-    def _init_worker(self):
+    def _init_worker(self, cache_dtype):
         assert self.parallel_config.world_size == 1, (
             "OpenVINO worker only supports single inference device.")
 
@@ -469,7 +478,7 @@ class OpenVINOExecutor(ExecutorBase):
             self.scheduler_config,
             self.device_config,
             lora_config=self.lora_config,
-            kv_cache_dtype=self.cache_config.cache_dtype,
+            kv_cache_dtype=cache_dtype,
         )
         self.driver_worker.init_model()
         self.driver_worker.load_model()
