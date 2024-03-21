@@ -62,8 +62,9 @@ class OpenVINOCacheEngine:
 
         if device_config.device.type == "cpu":
             if cache_config.block_size != 1:
-                print(f"Warning: CPU only support block_size = 1, current is {cache_config.block_size}, forced to 1.")
+                cache_config.num_cpu_blocks *= cache_config.block_size
                 cache_config.block_size = 1
+                print(f"Warning: CPU only support block_size = 1, it's forced to 1, num_cpu_blocks is set to {cache_config.num_cpu_blocks}.")
         self.block_size = cache_config.block_size
         self.num_gpu_blocks = cache_config.num_gpu_blocks
         self.num_cpu_blocks = cache_config.num_cpu_blocks
