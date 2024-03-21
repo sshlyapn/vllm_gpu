@@ -49,18 +49,20 @@ class OpenVINOCacheEngine:
         cache_config: CacheConfig,
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
-        device_config: DeviceConfig
+        device_config: DeviceConfig,
+        ov_core: ov.Core
     ) -> None:
         self.cache_config = cache_config
         self.model_config = model_config
         self.parallel_config = parallel_config
         self.device_config = device_config
+        self.ov_core = ov_core
 
         self.head_size = model_config.get_head_size()
         self.num_layers = model_config.get_num_layers(parallel_config)
         self.num_heads = model_config.get_num_kv_heads(parallel_config)
 
-        if device_config.device.type == "cpu":
+        if "CPU" in device_config.get_ov_device():
             if cache_config.block_size != 1:
                 cache_config.num_cpu_blocks *= cache_config.block_size
                 cache_config.block_size = 1
@@ -105,10 +107,15 @@ class OpenVINOCacheEngine:
         gpu_cache: List[OpenVINOKVCache] = []
         key_block_shape = (self.num_gpu_blocks, *self.get_key_block_shape())
         value_block_shape = (self.num_gpu_blocks, *self.get_value_block_shape())
-        remote_context = ov.Core().get_default_context("GPU")
+
+        ov_device = self.device_config.get_ov_device()
+        if "CPU" in ov_device:
+            raise RuntimeError("Attempt to allocate GPU's KV cache using CPU device")
+
+        remote_context = self.ov_core.get_default_context(ov_device)
         for _ in range(self.num_layers):
-            key_blocks = remote_context.create_tensor(self.cache_dtype, key_block_shape)
-            value_blocks = remote_context.create_tensor(self.cache_dtype, value_block_shape)
+            key_blocks = remote_context.create_tensor(self.cache_dtype, ov.Shape(key_block_shape), {})
+            value_blocks = remote_context.create_tensor(self.cache_dtype, ov.Shape(value_block_shape), {})
             gpu_cache.append((key_blocks, value_blocks))
         return gpu_cache
 
@@ -152,13 +159,19 @@ class OpenVINOCacheEngine:
         # probably, we need to force OpenVINO kv cache data types per device and assert
         # if user specified a different value
         if cache_dtype == "auto":
-            if device_config.device.type == "cpu":
-                core = ov.Core()
-                inference_precision = core.get_property("CPU", hints.inference_precision)
+            ov_device = device_config.get_ov_device()
+            core = ov.Core()
+            inference_precision = core.get_property(ov_device, hints.inference_precision)
+            if "CPU" in ov_device:
                 if inference_precision == ov.Type.bf16:
                     cache_dtype = torch.bfloat16
                 else:
                     cache_dtype = torch.float16
+            elif "GPU" in ov_device:
+                if inference_precision == ov.Type.f16:
+                    cache_dtype = torch.float16
+                else:
+                    cache_dtype = torch.float32
             else:
                 cache_dtype = model_config.dtype
         else:
@@ -261,7 +274,11 @@ class OpenVINOWorker:
 
         # TODO: ilavreno: currently we cannot specify GPU as device
         # so, the code below is dead, but we can change the condition and test it
-        if self.device_config.device.type == 'gpu':
+        if "GPU" in self.device_config.get_ov_device():
+            import openvino.properties.intel_gpu as intel_gpu
+            ov_device = self.device_config.get_ov_device()
+            ov_core = self.model_runner.model._ov_core
+
             # Execute a forward pass with dummy inputs to profile the memory usage
             # of the model.
             def model_profile_run():
@@ -270,14 +287,16 @@ class OpenVINOWorker:
 
                 max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
                 max_num_seqs = self.scheduler_config.max_num_seqs
-                profiling_num_gpu_blocks = (max_num_batched_tokens + self.cache_config.block_size - 1) // self.cache_config.block_size
-                self.cache_config.num_gpu_blocks = profiling_num_gpu_blocks
+                cache_config = CacheConfig(block_size, device_memory_utilization, cpu_swap_space, cache_dtype)
+                cache_config.num_gpu_blocks = 1
+                cache_config.num_cpu_blocks = 0
 
                 profiling_cache_engine = OpenVINOCacheEngine(
-                    self.cache_config,
+                    cache_config,
                     self.model_config,
                     self.parallel_config,
-                    self.device_config)
+                    self.device_config,
+                    ov_core)
 
                 # Profile memory usage with max_num_sequences sequences and the total
                 # number of tokens equal to max_num_batched_tokens.
@@ -286,39 +305,62 @@ class OpenVINOWorker:
                     seq_len = (max_num_batched_tokens // max_num_seqs +
                             (group_id < max_num_batched_tokens % max_num_seqs))
                     seq_data = SequenceData([0] * seq_len)
-                    seq_num_blocks = (seq_len + self.cache_config.block_size - 1) // self.cache_config.block_size
-                    block_tables = torch.ones(seq_num_blocks, dtype=torch.int32)
                     seq = SequenceGroupMetadata(
                         request_id=str(group_id),
                         is_prompt=True,
                         seq_data={group_id: seq_data},
                         sampling_params=sampling_params,
-                        block_tables=block_tables,
+                        block_tables=None,
                         lora_request=None,
                     )
                     seqs.append(seq)
 
                 # Run the model with the dummy inputs.
+                self.model_runner.block_size = block_size
                 self.model_runner.execute_model(seqs, profiling_cache_engine.gpu_cache)
+
+                print("Memory statistics for dummy inputs:", ov_core.get_property(ov_device, intel_gpu.memory_statistics))
+                print("Total device mem:", ov_core.get_property(ov_device, intel_gpu.device_total_mem_size))
 
                 # explicitly delete temporary KV cache manager to free KV cache itself
                 # and in this case we will profile only consumption of ov.CompiledModel to
                 # compute max_num_batched_tokens tokens
                 del profiling_cache_engine
 
-            model_profile_run()
+            # Commented out since after activations' buffers initialization results of memory_statistics
+            # property looks incorrect, so use simpler heuristic for now. Need to check memory_statistics report.
+            # model_profile_run()
 
             # Calculate the number of blocks that can be allocated with the
             # profiled peak memory.
-            core = ov.Core()
-            free_gpu_memory, total_gpu_memory = core.get_property("GPU", ov.intel_gpu_hint.available_device_mem), \
-                                                core.get_property("GPU", ov.intel_gpu_hint.device_total_mem_size)
-            peak_memory = self.init_gpu_memory - free_gpu_memory
+            memory_statistics = ov_core.get_property(ov_device, intel_gpu.memory_statistics)
+
+            import openvino.properties.device as device
+            gpu_type = ov_core.get_property(ov_device, device.type)
+
+            used_device_mem = 0
+            total_gpu_memory = ov_core.get_property(ov_device, intel_gpu.device_total_mem_size)
+            if gpu_type == device.Type.INTEGRATED:
+                # WA: iGPU reports all available RAM as total, reduce this size twice just to keep some extra space
+                total_gpu_memory /= 2
+                for mem_type in memory_statistics:
+                    used_device_mem += memory_statistics[mem_type]
+            else:
+                if "usm_device" in memory_statistics:
+                    used_device_mem = memory_statistics["usm_device"]
+                elif "cl_mem" in memory_statistics:
+                    used_device_mem = memory_statistics["cl_mem"]
+
+
+            # memory_statistics includes only required memory for weights, so add activations using heuristic
+            used_device_mem = max(used_device_mem * 1.2, 1024 * 1024 * 1024)
+            print(f"Total {ov_device} memory: {int(total_gpu_memory / 1024 / 1024)}MB. "
+                  f"Amount of memory needed for weights and activations: {int(used_device_mem / 1024 / 1024)}MB")
 
             cache_block_size = self.get_cache_block_size_bytes(
                 block_size, cache_dtype)
             num_gpu_blocks = int(
-                (total_gpu_memory * device_memory_utilization - peak_memory) //
+                (total_gpu_memory * device_memory_utilization - used_device_mem) //
                 cache_block_size)
             num_gpu_blocks = max(num_gpu_blocks, 0)
             gc.collect()
@@ -328,7 +370,8 @@ class OpenVINOWorker:
     def init_cache_engine(self, cache_config: CacheConfig) -> None:
         self.cache_config = cache_config
         self.cache_engine = OpenVINOCacheEngine(self.cache_config, self.model_config,
-                                                self.parallel_config, self.device_config)
+                                                self.parallel_config, self.device_config,
+                                                self.model_runner.model._ov_core)
         self.gpu_cache = self.cache_engine.gpu_cache
         self.cpu_cache = self.cache_engine.cpu_cache
         self.model_runner.set_block_size(self.cache_engine.block_size)
@@ -400,7 +443,8 @@ class OpenVINOWorker:
         """
         return OpenVINOCacheEngine.get_cache_block_size(block_size, cache_dtype,
                                                         self.model_config,
-                                                        self.parallel_config)
+                                                        self.parallel_config,
+                                                        self.device_config)
 
     def _init_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
