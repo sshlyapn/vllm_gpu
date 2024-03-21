@@ -88,6 +88,7 @@ class ModelRunner:
         with measure_cuda_memory(self.device) as m:
             self.model = get_model(self.model_config,
                                    self.device_config,
+                                   kv_cache_dtype=self.kv_cache_dtype,
                                    lora_config=self.lora_config,
                                    parallel_config=self.parallel_config,
                                    scheduler_config=self.scheduler_config)

@@ -18,6 +18,7 @@ from vllm.utils import (get_ip, get_open_port, get_distributed_init_method,
 from vllm.sampling_params import SamplingParams
 
 import openvino as ov
+import openvino.properties.hint as hints
 
 logger = init_logger(__name__)
 
@@ -59,6 +60,11 @@ class OpenVINOCacheEngine:
         self.num_layers = model_config.get_num_layers(parallel_config)
         self.num_heads = model_config.get_num_kv_heads(parallel_config)
 
+        if device_config.device.type == "cpu":
+            if cache_config.block_size != 1:
+                cache_config.num_cpu_blocks *= cache_config.block_size
+                cache_config.block_size = 1
+                print(f"Warning: CPU only support block_size = 1, it's forced to 1, num_cpu_blocks is set to {cache_config.num_cpu_blocks}.")
         self.block_size = cache_config.block_size
         self.num_gpu_blocks = cache_config.num_gpu_blocks
         self.num_cpu_blocks = cache_config.num_cpu_blocks
@@ -146,7 +152,15 @@ class OpenVINOCacheEngine:
         # probably, we need to force OpenVINO kv cache data types per device and assert
         # if user specified a different value
         if cache_dtype == "auto":
-            cache_dtype = model_config.dtype
+            if device_config.device.type == "cpu":
+                core = ov.Core()
+                inference_precision = core.get_property("CPU", hints.inference_precision)
+                if inference_precision == ov.Type.bf16:
+                    cache_dtype = torch.bfloat16
+                else:
+                    cache_dtype = torch.float16
+            else:
+                cache_dtype = model_config.dtype
         else:
             cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype]
         ov_cache_dtype = TORCH_DTYPE_TO_OPENVINO_DTYPE[cache_dtype]
@@ -469,7 +483,9 @@ class OpenVINOExecutor(ExecutorBase):
             self.scheduler_config,
             self.device_config,
             lora_config=self.lora_config,
-            kv_cache_dtype=self.cache_config.cache_dtype,
+            kv_cache_dtype=OpenVINOCacheEngine.get_cache_dtype(self.cache_config.cache_dtype,
+                                                               self.model_config,
+                                                               self.device_config)
         )
         self.driver_worker.init_model()
         self.driver_worker.load_model()
