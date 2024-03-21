@@ -6,7 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm.config import (DeviceConfig, ModelConfig, LoRAConfig, ParallelConfig,
+from vllm.config import (DeviceConfig, CacheConfig, ModelConfig, LoRAConfig, ParallelConfig,
                          SchedulerConfig)
 from vllm.logger import init_logger
 from vllm.model_executor import get_model, InputMetadata, SamplingMetadata
@@ -41,13 +41,14 @@ class ModelRunner:
         parallel_config: ParallelConfig,
         scheduler_config: SchedulerConfig,
         device_config: DeviceConfig,
+        cache_config: Optional[CacheConfig],
         lora_config: Optional[LoRAConfig],
-        kv_cache_dtype: Optional[str] = "auto",
         is_driver_worker: bool = False,
     ):
         self.model_config = model_config
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
+        self.cache_config = cache_config
         self.lora_config = lora_config
         self.is_driver_worker = is_driver_worker
 
@@ -78,7 +79,7 @@ class ModelRunner:
         self.graph_block_tables = None  # Set after initial profiling.
         # cache in_wsl result
         self.in_wsl = in_wsl()
-        self.kv_cache_dtype = kv_cache_dtype
+        self.kv_cache_dtype = cache_config.cache_dtype if cache_config else None
 
         # Set enforce_eager to True for Neuron / OpenVINO backends, to avoid capturing graph
         if self.device_config.is_neuron or self.device_config.is_openvino:
@@ -88,7 +89,7 @@ class ModelRunner:
         with measure_cuda_memory(self.device) as m:
             self.model = get_model(self.model_config,
                                    self.device_config,
-                                   kv_cache_dtype=self.kv_cache_dtype,
+                                   cache_config=self.cache_config,
                                    lora_config=self.lora_config,
                                    parallel_config=self.parallel_config,
                                    scheduler_config=self.scheduler_config)

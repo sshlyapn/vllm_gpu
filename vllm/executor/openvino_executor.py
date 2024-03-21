@@ -60,11 +60,6 @@ class OpenVINOCacheEngine:
         self.num_layers = model_config.get_num_layers(parallel_config)
         self.num_heads = model_config.get_num_kv_heads(parallel_config)
 
-        if device_config.device.type == "cpu":
-            if cache_config.block_size != 1:
-                cache_config.num_cpu_blocks *= cache_config.block_size
-                cache_config.block_size = 1
-                print(f"Warning: CPU only support block_size = 1, it's forced to 1, num_cpu_blocks is set to {cache_config.num_cpu_blocks}.")
         self.block_size = cache_config.block_size
         self.num_gpu_blocks = cache_config.num_gpu_blocks
         self.num_cpu_blocks = cache_config.num_cpu_blocks
@@ -199,8 +194,8 @@ class OpenVINOWorker:
         parallel_config: ParallelConfig,
         scheduler_config: SchedulerConfig,
         device_config: DeviceConfig,
+        cache_config: CacheConfig,
         lora_config: Optional[LoRAConfig] = None,
-        kv_cache_dtype: Optional[str] = "auto",
     ) -> None:
         self.model_config = model_config
         self.parallel_config = parallel_config
@@ -215,8 +210,8 @@ class OpenVINOWorker:
                                         parallel_config,
                                         scheduler_config,
                                         device_config,
+                                        cache_config,
                                         lora_config=self.lora_config,
-                                        kv_cache_dtype=kv_cache_dtype,
                                         is_driver_worker=True)
         # Uninitialized cache engine. Will be initialized by self.init_cache_engine().
         self.cache_config = None
@@ -477,15 +472,23 @@ class OpenVINOExecutor(ExecutorBase):
         assert self.parallel_config.world_size == 1, (
             "OpenVINO worker only supports single inference device.")
 
+        if self.device_config.device.type == "cpu":
+            if self.cache_config.block_size != 1:
+                self.cache_config.block_size = 1
+                print(f"Warning: CPU only support block_size = 1, it's forced to 1.")
+
+        self.cache_config.ov_cache_dtype = \
+            OpenVINOCacheEngine.get_cache_dtype(self.cache_config.cache_dtype,
+                                                self.model_config,
+                                                self.device_config)
+
         self.driver_worker = OpenVINOWorker(
             self.model_config,
             self.parallel_config,
             self.scheduler_config,
             self.device_config,
-            lora_config=self.lora_config,
-            kv_cache_dtype=OpenVINOCacheEngine.get_cache_dtype(self.cache_config.cache_dtype,
-                                                               self.model_config,
-                                                               self.device_config)
+            self.cache_config,
+            lora_config=self.lora_config
         )
         self.driver_worker.init_model()
         self.driver_worker.load_model()

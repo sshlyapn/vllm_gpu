@@ -5,7 +5,7 @@ import math
 import torch
 import numpy as np
 
-from vllm.config import DeviceConfig, ModelConfig
+from vllm.config import DeviceConfig, ModelConfig, CacheConfig
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.sequence import SamplerOutput
@@ -56,9 +56,10 @@ def ov_wrapper(self, *args, **kwargs) -> torch.Tensor:
 
 
 def patch_stateful_model(
+    model_config: ModelConfig,
+    cache_config: CacheConfig,
     model: ov.Model,
-    factory,
-    kv_cache_dtype: Type):
+    factory):
     print('TRANSFORMING OPTIMUM-INTEL MODEL TO vLLM COMPATIBLE FORM')
     from openvino.runtime.passes import Manager, MatcherPass, WrapType, Matcher, AnyInput, Or
     from openvino.runtime import opset13
@@ -129,9 +130,14 @@ def patch_stateful_model(
                 real_k = mapping[k_current]
                 real_v = mapping[v_current]
                 hidden_shape = real_q.get_partial_shape()
+
+                kv_heads_num = model_config.get_total_num_kv_heads()
+                head_size = model_config.get_head_size()
+                block_size = cache_config.block_size
+
                 hidden_dim = hidden_shape[hidden_shape.rank.get_length() - 1].get_length()  # TODO: What if it is a dynamic? Need to insert a ShapeOf sub-graph instead
-                k_parameter = opset13.parameter(shape=[-1, -1, -1, -1, -1], dtype=kv_cache_dtype)
-                v_parameter = opset13.parameter(shape=[-1, -1, -1, -1], dtype=kv_cache_dtype)
+                k_parameter = opset13.parameter(shape=[-1, kv_heads_num, -1, block_size, -1], dtype=cache_config.ov_cache_dtype)
+                v_parameter = opset13.parameter(shape=[-1, kv_heads_num, head_size, block_size], dtype=cache_config.ov_cache_dtype)
                 kv_parameters.append(k_parameter)
                 kv_parameters.append(v_parameter)
                 # TODO: The rank 4 is used in the following code, but it is not guaranteed for all models, adopt to other ranks.
@@ -434,7 +440,7 @@ def ov_sample(
 
 def get_model(model_config: ModelConfig,
               device_config: DeviceConfig,
-              kv_cache_dtype: Type,
+              cache_config: CacheConfig,
               **kwargs) -> torch.nn.Module:
     lora_config = kwargs.get("lora_config", None)
     if lora_config:
@@ -455,7 +461,7 @@ def get_model(model_config: ModelConfig,
             # Keep factory to destroy it in a particular moment when all other objects referencing custom nodes are destoyed
             pt_model.ov_node_factory = NodeFactory()
             pt_model.ov_node_factory.add_extension('libuser_ov_extensions.so')
-        patch_stateful_model(pt_model.model, pt_model.ov_node_factory, kv_cache_dtype)
+        patch_stateful_model(model_config, cache_config, pt_model.model, pt_model.ov_node_factory)
         core = ov.Core()
         ov_compiled = core.compile_model(pt_model.model, "CPU")
         pt_model._ov_request = ov_compiled.create_infer_request()
@@ -469,6 +475,6 @@ def get_model(model_config: ModelConfig,
     else:
         from vllm.model_executor.model_loader import get_model
         pt_model = get_model(model_config, device_config, **kwargs)
-        _patch_model_with_openvino(pt_model, model_config, kv_cache_dtype)
+        _patch_model_with_openvino(pt_model, model_config, cache_config.ov_cache_dtype)
 
     return pt_model
