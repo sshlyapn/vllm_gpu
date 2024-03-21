@@ -9,13 +9,21 @@ RUN apt-get update -y && \
 WORKDIR /workspace
 
 # build and install OpenVINO
-RUN git clone --recurse-submodules -b pytorch_module_extension https://github.com/slyalin/openvino.git
+RUN git clone https://github.com/openvinotoolkit/openvino.git && \
+    cd /workspace/openvino && \
+    git checkout 326200598ae346eab72460b65f2fa748b22e8f74 && \
+    git submodule update --init -- /workspace/openvino/thirdparty/xbyak \
+                                   /workspace/openvino/thirdparty/pugixml \
+                                   /workspace/openvino/thirdparty/open_model_zoo \
+                                   /workspace/openvino/src/plugins/intel_cpu/thirdparty/mlas \
+                                   /workspace/openvino/src/plugins/intel_cpu/thirdparty/onednn && \
+    cd -
 RUN /workspace/openvino/install_build_dependencies.sh
-RUN cmake -DCPACK_GENERATOR=DEB -DENABLE_PYTHON=ON -DENABLE_PYTHON_PACKAGING=ON -DENABLE_CPPLINT=OFF \
+RUN python3 -m pip install -r /workspace/openvino/src/bindings/python/wheel/requirements-dev.txt
+RUN cmake -DCPACK_GENERATOR=DEB -DENABLE_PYTHON=ON -DENABLE_PYTHON_PACKAGING=ON -DENABLE_CPPLINT=OFF -DENABLE_SAMPLES=OFF \
     -DENABLE_INTEL_GPU=OFF -DENABLE_TEMPLATE=OFF -DENABLE_AUTO=OFF -DENABLE_HETERO=OFF -DENABLE_AUTO_BATCH=OFF \
     -DENABLE_OV_TF_FRONTEND=OFF -DENABLE_OV_ONNX_FRONTEND=OFF -DENABLE_OV_TF_LITE_FRONTEND=OFF -DENABLE_OV_PADDLE_FRONTEND=OFF \
     -S /workspace/openvino -B /workspace/openvino_build
-RUN python3 -m pip install -r /workspace/openvino/src/bindings/python/wheel/requirements-dev.txt
 RUN cmake --build /workspace/openvino_build --parallel 8
 RUN cmake -P /workspace/openvino_build/cmake_install.cmake
 
