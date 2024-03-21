@@ -524,6 +524,13 @@ class DeviceConfig:
             # Set device with device type
             self.device = torch.device(self.device_type)
 
+    def get_ov_device(self):
+        if not is_openvino():
+            raise RuntimeError("Unable to get device for non OV backend.")
+
+        ov_device = os.getenv('OV_DEVICE', "CPU")
+        return ov_device
+
     @property
     def is_neuron(self):
         return self.device_type == "neuron"

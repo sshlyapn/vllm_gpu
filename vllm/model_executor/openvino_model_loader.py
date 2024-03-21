@@ -48,10 +48,17 @@ def ov_wrapper(self, *args, **kwargs) -> torch.Tensor:
     if input_metadata.max_context_len is not None:
         # available from the second iteration
         inputs.append(input_metadata.max_context_len)
-        inputs.append(input_metadata.context_lens)
-        inputs.append(input_metadata.block_tables)
     else:
         inputs.append(np.array(kwargs['input_ids'].shape[1], dtype=np.int64))   # for optimum-based models this parameter can be used even on the first iteration
+        # inputs.append(np.array(0, dtype=np.int32))
+
+    # WA: Since GPU uses original PA kernel for the first iteration, it's crucial to provide properly
+    # configured context_lens and block_tables for the prompt stage.
+    # Additionally, changes were made in ModelRunner._prepare_prompt() method to ensure the
+    # configuration of these inputs for prompt stage too (originally, context_lens and block_tables
+    # were supposed to process models' prefix at prompt stage, which is not supported by OpenVINO yet).
+    inputs.append(input_metadata.context_lens)
+    inputs.append(input_metadata.block_tables)
 
     self._ov_request.start_async(inputs, share_inputs=True)
     self._ov_request.wait()
@@ -271,7 +278,7 @@ def patch_stateful_model(
                 add_assign_consumers(mapping[v_concat])
 
                 replace_node(m.get_match_root(), pa_transpose)
-                print('INSERTED PageAttentionExtension')
+                print('INSERTED PageAttentionExtension2222')
                 return True
 
             self.register_matcher(Matcher(sdpa, "StateManagementPattern"), callback)
@@ -387,8 +394,8 @@ def patch_stateful_model(
 def _patch_model_with_openvino(
         pt_model: torch.nn.Module,
         model_config: ModelConfig,
-        kv_cache_dtype: Type,
-        is_cpu: bool):
+        device_config: DeviceConfig,
+        kv_cache_dtype: Type):
     print(' ============= PATCHING MODEL =============')
     from vllm.model_executor.layers.attention.attention import Attention
     from openvino.frontend.pytorch import ModuleExtension, ConversionExtension
@@ -442,7 +449,7 @@ def _patch_model_with_openvino(
     start_loc = torch.ones(max_batch_size, dtype=torch.long)
     block_tables = torch.ones((max_batch_size, max_num_blocks), dtype=torch.int32)
 
-    if is_cpu:
+    if device_config.get_ov_device() == "CPU":
         kv_cache = [(torch.ones((_EXAMPLE_NUM_BLOCKS, num_kv_heads, _EXAMPLE_BLOCK_SIZE, head_size), dtype=kv_cache_dtype),
                     torch.ones((_EXAMPLE_NUM_BLOCKS, num_kv_heads, _EXAMPLE_BLOCK_SIZE, head_size), dtype=kv_cache_dtype))] * num_hidden_layers
     else:
@@ -539,9 +546,10 @@ def _patch_model_with_openvino(
         print('>>>>>>>>>>>>> OV MODEL CONVERTED')
 
     core = Core()
-    ov_compiled_model = core.compile_model(ov_model, "CPU")
+    ov_compiled_model = core.compile_model(ov_model, device_config.get_ov_device())
     ov_request = ov_compiled_model.create_infer_request()
 
+    pt_model._ov_core = core
     pt_model._ov_request = ov_request
     pt_model._openvino_patch_orig_forward = pt_model.forward
     pt_model.forward = partial(ov_wrapper, pt_model)
@@ -609,7 +617,7 @@ def get_model(model_config: ModelConfig,
             load_in_8bit=load_in_8bit,
             trust_remote_code=model_config.trust_remote_code
         )
-        patch_stateful_model(pt_model.model, kv_cache_dtype, device_config.device.type == "cpu")
+        patch_stateful_model(pt_model.model, kv_cache_dtype, device_config.get_ov_device() == "CPU")
 
         # For deployment outside vLLM
         model_file_name = os.environ.get('VLLM_OPENVINO_EXPORTED_IR_NAME', '')
@@ -617,8 +625,10 @@ def get_model(model_config: ModelConfig,
             ov.save_model(pt_model.model, model_file_name)
 
         core = ov.Core()
-        ov_compiled = core.compile_model(pt_model.model, "CPU")
+        ov_device = device_config.get_ov_device()
+        ov_compiled = core.compile_model(pt_model.model, ov_device)
         pt_model._ov_request = ov_compiled.create_infer_request()
+        pt_model._ov_core = core
 
         pt_model._openvino_patch_orig_forward = pt_model.forward
         pt_model.forward = partial(ov_wrapper, pt_model)
@@ -629,6 +639,6 @@ def get_model(model_config: ModelConfig,
     else:
         from vllm.model_executor.model_loader import get_model
         pt_model = get_model(model_config, device_config, **kwargs)
-        _patch_model_with_openvino(pt_model, model_config, kv_cache_dtype, device_config.device.type == "cpu")
+        _patch_model_with_openvino(pt_model, model_config, device_config, kv_cache_dtype)
 
     return pt_model
