@@ -75,6 +75,7 @@ def run_vllm(
     device: str,
     enable_prefix_caching: bool,
     gpu_memory_utilization: float = 0.9,
+    swap_space: int = 4,
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(model=model,
@@ -89,7 +90,8 @@ def run_vllm(
               enforce_eager=enforce_eager,
               kv_cache_dtype=kv_cache_dtype,
               device=device,
-              enable_prefix_caching=enable_prefix_caching)
+              enable_prefix_caching=enable_prefix_caching,
+              swap_space=swap_space)
 
     # Add the requests to the engine.
     for prompt, _, output_len in requests:
@@ -213,7 +215,7 @@ def main(args: argparse.Namespace):
             args.tensor_parallel_size, args.seed, args.n, args.use_beam_search,
             args.trust_remote_code, args.dtype, args.max_model_len,
             args.enforce_eager, args.kv_cache_dtype, args.device,
-            args.enable_prefix_caching, args.gpu_memory_utilization)
+            args.enable_prefix_caching, args.gpu_memory_utilization, args.swap_space)
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -307,13 +309,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda",
-        choices=["cuda"],
+        default="auto",
+        choices=["auto", "cuda"],
         help='device type for vLLM execution, supporting CUDA only currently.')
     parser.add_argument(
         "--enable-prefix-caching",
         action='store_true',
         help="enable automatic prefix caching for vLLM backend.")
+    parser.add_argument('--swap-space',
+        type=int,
+        default=50,
+        help='CPU swap space size (GiB)')
     args = parser.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model
