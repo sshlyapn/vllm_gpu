@@ -453,7 +453,6 @@ def get_model(model_config: ModelConfig,
             model_config.model,
             export=True,
             compile=False,
-            load_in_8bit=False,
             trust_remote_code=model_config.trust_remote_code
         )
         if not hasattr(pt_model, 'ov_node_factory'):
