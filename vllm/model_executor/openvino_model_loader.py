@@ -45,18 +45,12 @@ def ov_wrapper(self, *args, **kwargs) -> torch.Tensor:
         input_metadata.slot_mapping
     ]
 
-    if input_metadata.max_context_len is not None:
-        # available from the second iteration
-        inputs.append(input_metadata.max_context_len)
-    else:
-        inputs.append(np.array(kwargs['input_ids'].shape[1], dtype=np.int64))   # for optimum-based models this parameter can be used even on the first iteration
-        # inputs.append(np.array(0, dtype=np.int32))
-
     # WA: Since GPU uses original PA kernel for the first iteration, it's crucial to provide properly
     # configured context_lens and block_tables for the prompt stage.
     # Additionally, changes were made in ModelRunner._prepare_prompt() method to ensure the
-    # configuration of these inputs for prompt stage too (originally, context_lens and block_tables
-    # were supposed to process models' prefix at prompt stage, which is not supported by OpenVINO yet).
+    # configuration of these inputs for prompt stage (originally context_lens, block_tables and max_context_len
+    # were supposed to process models' prefix at prompt stage, which is not supported by).
+    inputs.append(input_metadata.max_context_len)
     inputs.append(input_metadata.context_lens)
     inputs.append(input_metadata.block_tables)
 

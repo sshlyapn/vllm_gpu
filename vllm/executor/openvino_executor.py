@@ -339,7 +339,6 @@ class OpenVINOWorker:
                     seqs.append(seq)
 
                 # Run the model with the dummy inputs.
-                self.model_runner.block_size = block_size
                 self.model_runner.execute_model(seqs, profiling_cache_engine.gpu_cache)
 
                 print("Memory statistics for dummy inputs:", ov_core.get_property(ov_device, intel_gpu.memory_statistics))
