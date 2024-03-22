@@ -236,6 +236,7 @@ class ModelRunner:
             _pad_to_max(mapping, max_prompt_len, pad=0)
             for mapping in lora_index_mapping
         ]
+        max_context_len = max(context_lens)
         context_lens_tensor = torch.tensor(context_lens,
                                            dtype=torch.int,
                                            device=self.device)
@@ -263,7 +264,7 @@ class ModelRunner:
             prompt_lens=prompt_lens_tensor,
             max_seq_len=max_prompt_len,
             start_loc=start_loc_tensor,
-            max_context_len=None,
+            max_context_len=max_context_len,
             context_lens=context_lens_tensor,
             block_tables=block_tables,
             use_cuda_graph=False,
