@@ -9,7 +9,7 @@ RUN apt-get update -y && \
 WORKDIR /workspace
 
 # build and install OpenVINO
-RUN git clone https://github.com/openvinotoolkit/openvino.git && \
+RUN git clone -b luocheng/pageattn_opt_bf16_cvt https://github.com/luo-cheng2021/openvino.git && \
     cd /workspace/openvino && \
     git checkout 326200598ae346eab72460b65f2fa748b22e8f74 && \
     git submodule update --init -- /workspace/openvino/thirdparty/xbyak \
