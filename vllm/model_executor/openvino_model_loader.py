@@ -449,7 +449,13 @@ def get_model(model_config: ModelConfig,
     if is_openvino_optimum_intel():
         import openvino as ov
         from optimum.intel import OVModelForCausalLM
-        pt_model = OVModelForCausalLM.from_pretrained(model_config.model, export=True, compile=False, load_in_8bit=False, trust_remote_code=True) # need stateful because it also enables SDPA
+        pt_model = OVModelForCausalLM.from_pretrained(
+            model_config.model,
+            export=True,
+            compile=False,
+            load_in_8bit=False,
+            trust_remote_code=model_config.trust_remote_code
+        )
         if not hasattr(pt_model, 'ov_node_factory'):
             from openvino.runtime.utils.node_factory import NodeFactory
             # Keep factory to destroy it in a particular moment when all other objects referencing custom nodes are destoyed
