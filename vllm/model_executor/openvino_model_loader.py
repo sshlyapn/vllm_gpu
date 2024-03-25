@@ -51,8 +51,9 @@ def ov_wrapper(self, *args, **kwargs) -> torch.Tensor:
     else:
         inputs.append(np.array(0, dtype=np.int32))   # for optimum-based models this parameter can be used even on the first iteration
 
-    outputs = self._ov_request.infer(inputs, share_inputs=True, share_outputs=False)
-    return torch.from_numpy(outputs[0])
+    self._ov_request.start_async(inputs, share_inputs=True)
+    self._ov_request.wait()
+    return torch.from_numpy(self._ov_request.get_tensor("logits").data)
 
 
 def patch_stateful_model(

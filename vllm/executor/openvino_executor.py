@@ -119,6 +119,9 @@ class OpenVINOCacheEngine:
         for _ in range(self.num_layers):
             key_blocks = ov.Tensor(self.cache_dtype, key_block_shape)
             value_blocks = ov.Tensor(self.cache_dtype, value_block_shape)
+            # force allocation
+            key_blocks.data[:] = 0
+            value_blocks.data[:] = 0
             cpu_cache.append((key_blocks, value_blocks))
         return cpu_cache
 
