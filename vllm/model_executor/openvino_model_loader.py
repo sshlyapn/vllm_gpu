@@ -1,9 +1,11 @@
 """Utilities for selecting and loading models."""
 from functools import partial
 from typing import Optional
+from pathlib import Path
 import math
 import torch
 import numpy as np
+from huggingface_hub import HfApi
 
 from vllm.config import DeviceConfig, ModelConfig
 from vllm.model_executor.sampling_metadata import SamplingMetadata
@@ -433,6 +435,25 @@ def ov_sample(
 ) -> Optional[SamplerOutput]:
     return self.sampler(None, hidden_states, sampling_metadata)
 
+
+def require_model_export(model_id, revision=None, subfolder=None):
+    model_dir = Path(model_id)
+    if subfolder is not None:
+        model_dir = model_dir / subfolder
+    if model_dir.is_dir():
+        return not (model_dir / "openvino_model.xml").exists() or not (model_dir / "openvino_model.bin").exists()
+
+    hf_api =  HfApi()
+    try:
+        model_info = hf_api.model_info(model_id, revision=revision or "main")
+        normalized_subfolder = None if subfolder is None else Path(subfolder).as_posix()
+        model_files = [file.rfilename for file in model_info.siblings if normalized_subfolder is None or file.rfilename.startswith(normalized_subfolder)]
+        ov_model_path = "openvino_model.xml" if subfolder is None else f"{normalized_subfolder}/openvino_model.xml"
+        return not ov_model_path in model_files or not ov_model_path.replace(".xml", ".bin") in model_files
+    except Exception:
+         return True
+
+
 def get_model(model_config: ModelConfig,
               device_config: DeviceConfig,
               kv_cache_dtype: Type,
@@ -450,9 +471,16 @@ def get_model(model_config: ModelConfig,
     if is_openvino_optimum_intel():
         import openvino as ov
         from optimum.intel import OVModelForCausalLM
+        export = require_model_export(model_config.model)
+        if export:
+            print(f'[ INFO ] Provided model id {model_config.model} does not contain OpenVINO IR, the model will be converted to IR with default options. '
+                  'If you need to use specific options for model conversion, use optimum-cli export openvino with desired options.')
+        else:
+            print(f'[ INFO ] OpenVINO IR is avaialble for provided model id {model_config.model}. '
+                  'This IR will be used for inference as-is, all possible options that may affect model conversion are ignored.')
         pt_model = OVModelForCausalLM.from_pretrained(
             model_config.model,
-            export=True,
+            export=export,
             compile=False,
             trust_remote_code=model_config.trust_remote_code
         )
