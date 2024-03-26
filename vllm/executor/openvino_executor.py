@@ -276,6 +276,7 @@ class OpenVINOWorker:
         # so, the code below is dead, but we can change the condition and test it
         if "GPU" in self.device_config.get_ov_device():
             import openvino.properties.intel_gpu as intel_gpu
+            import openvino.properties.device as device
             ov_device = self.device_config.get_ov_device()
             ov_core = self.model_runner.model._ov_core
 
@@ -305,56 +306,60 @@ class OpenVINOWorker:
                     seq_len = (max_num_batched_tokens // max_num_seqs +
                             (group_id < max_num_batched_tokens % max_num_seqs))
                     seq_data = SequenceData([0] * seq_len)
+                    seq_num_blocks = (seq_len + block_size - 1) // block_size
+                    block_tables = [[0] * seq_num_blocks] * max_num_seqs
                     seq = SequenceGroupMetadata(
                         request_id=str(group_id),
                         is_prompt=True,
                         seq_data={group_id: seq_data},
                         sampling_params=sampling_params,
-                        block_tables=None,
+                        block_tables=block_tables,
                         lora_request=None,
                     )
                     seqs.append(seq)
 
+                self.model_runner.block_size = cache_config.block_size
+
                 # Run the model with the dummy inputs.
                 self.model_runner.execute_model(seqs, profiling_cache_engine.gpu_cache)
 
-                print("Memory statistics for dummy inputs:", ov_core.get_property(ov_device, intel_gpu.memory_statistics))
-                print("Total device mem:", ov_core.get_property(ov_device, intel_gpu.device_total_mem_size))
-
-                # explicitly delete temporary KV cache manager to free KV cache itself
-                # and in this case we will profile only consumption of ov.CompiledModel to
-                # compute max_num_batched_tokens tokens
+                # explicitly delete temporary KV cache manager to free KV cache when real inputs will be passed to OV
                 del profiling_cache_engine
 
-            # Commented out since after activations' buffers initialization results of memory_statistics
-            # property looks incorrect, so use simpler heuristic for now. Need to check memory_statistics report.
-            # model_profile_run()
+            print(f"Start profiling run with dummy inputs to evaluate memory usage for {ov_device}. It might take a while.")
 
-            # Calculate the number of blocks that can be allocated with the
-            # profiled peak memory.
-            memory_statistics = ov_core.get_property(ov_device, intel_gpu.memory_statistics)
-
-            import openvino.properties.device as device
-            gpu_type = ov_core.get_property(ov_device, device.type)
+            memory_statistics_before = ov_core.get_property(ov_device, intel_gpu.memory_statistics)
+            model_profile_run()
+            memory_statistics_after = ov_core.get_property(ov_device, intel_gpu.memory_statistics)
 
             used_device_mem = 0
-            total_gpu_memory = ov_core.get_property(ov_device, intel_gpu.device_total_mem_size)
-            if gpu_type == device.Type.INTEGRATED:
-                # WA: iGPU reports all available RAM as total, reduce this size twice just to keep some extra space
-                total_gpu_memory /= 2
-                for mem_type in memory_statistics:
-                    used_device_mem += memory_statistics[mem_type]
+            kv_cache_mem = 0
+            # `cl_mem` buffers are used for kv_cache inputs
+            if "cl_mem" in memory_statistics_before:
+                kv_cache_mem = memory_statistics_after["cl_mem"] - memory_statistics_before["cl_mem"]
             else:
-                if "usm_device" in memory_statistics:
-                    used_device_mem = memory_statistics["usm_device"]
-                elif "cl_mem" in memory_statistics:
-                    used_device_mem = memory_statistics["cl_mem"]
+                kv_cache_mem = memory_statistics_after["cl_mem"]
 
+            # sum up all used memory
+            if "cl_mem" in memory_statistics_after:
+                used_device_mem += memory_statistics_after["cl_mem"]
+            if "usm_device" in memory_statistics_after:
+                used_device_mem += memory_statistics_after["usm_device"]
 
-            # memory_statistics includes only required memory for weights, so add activations using heuristic
-            used_device_mem = max(used_device_mem * 1.2, 1024 * 1024 * 1024)
-            print(f"Total {ov_device} memory: {int(total_gpu_memory / 1024 / 1024)}MB. "
-                  f"Amount of memory needed for weights and activations: {int(used_device_mem / 1024 / 1024)}MB")
+            gpu_device_type = ov_core.get_property(ov_device, device.type)
+            if gpu_device_type == device.Type.INTEGRATED and "usm_host" in memory_statistics_after:
+                used_device_mem += memory_statistics_after["usm_host"]
+
+            used_device_mem -= kv_cache_mem
+            total_gpu_memory = ov_core.get_property(ov_device, intel_gpu.device_total_mem_size)
+
+            print(f"Total {ov_device} memory: {total_gpu_memory} bytes. "
+                  f"Amount of memory required to run the model with max_num_batched_tokens={self.scheduler_config.max_num_batched_tokens}: {used_device_mem} bytes")
+
+            if used_device_mem >= total_gpu_memory:
+                raise RuntimeError(
+                    f"The required memory size {used_device_mem} bytes for model is higher than total available GPU memory {total_gpu_memory} bytes."
+                    " Please consider to decrease `max_num_batched_tokens` or increase `gpu_memory_utilization`")
 
             cache_block_size = self.get_cache_block_size_bytes(
                 block_size, cache_dtype)
@@ -362,6 +367,11 @@ class OpenVINOWorker:
                 (total_gpu_memory * device_memory_utilization - used_device_mem) //
                 cache_block_size)
             num_gpu_blocks = max(num_gpu_blocks, 0)
+
+            if num_gpu_blocks == 0:
+                raise RuntimeError(
+                    "Predicted maximum of GPU KV cache blocks number is 0. Please consider to decrease `max_num_batched_tokens` or increase `gpu_memory_utilization`")
+
             gc.collect()
 
         return num_gpu_blocks, num_cpu_blocks
