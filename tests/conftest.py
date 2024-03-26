@@ -165,6 +165,7 @@ class VllmRunner:
         dtype: str = "half",
         disable_log_stats: bool = True,
         tensor_parallel_size: int = 1,
+        swap_space: int = 0,
         **kwargs,
     ) -> None:
         self.model = LLM(
@@ -172,7 +173,7 @@ class VllmRunner:
             tokenizer=tokenizer_name,
             trust_remote_code=True,
             dtype=dtype,
-            swap_space=0,
+            swap_space=swap_space,
             disable_log_stats=disable_log_stats,
             tensor_parallel_size=tensor_parallel_size,
             **kwargs,
