@@ -135,6 +135,8 @@ def is_openvino() -> bool:
     return is_openvino_available
 
 def is_openvino_optimum_intel() -> bool:
+    if os.environ.get('VLLM_ENFORCE_NATIVE_MODELLING'):
+        return False
     is_optimum_intel_available = is_openvino()
     try:
         import optimum.intel
