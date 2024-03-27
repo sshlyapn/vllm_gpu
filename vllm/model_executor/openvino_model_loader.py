@@ -59,7 +59,8 @@ def ov_wrapper(self, *args, **kwargs) -> torch.Tensor:
 def patch_stateful_model(
     model: ov.Model,
     factory,
-    kv_cache_dtype: Type):
+    kv_cache_dtype: Type,
+    is_cpu: bool):
     print('TRANSFORMING OPTIMUM-INTEL MODEL TO vLLM COMPATIBLE FORM')
     from openvino.runtime.passes import Manager, MatcherPass, WrapType, Matcher, AnyInput, Or
     from openvino.runtime import opset13
@@ -131,7 +132,10 @@ def patch_stateful_model(
                 real_v = mapping[v_current]
                 hidden_shape = real_q.get_partial_shape()
                 hidden_dim = hidden_shape[hidden_shape.rank.get_length() - 1].get_length()  # TODO: What if it is a dynamic? Need to insert a ShapeOf sub-graph instead
-                k_parameter = opset13.parameter(shape=[-1, -1, -1, -1, -1], dtype=kv_cache_dtype)
+                if is_cpu:
+                    k_parameter = opset13.parameter(shape=[-1, -1, -1, -1], dtype=kv_cache_dtype)
+                else:
+                    k_parameter = opset13.parameter(shape=[-1, -1, -1, -1, -1], dtype=kv_cache_dtype)
                 v_parameter = opset13.parameter(shape=[-1, -1, -1, -1], dtype=kv_cache_dtype)
                 kv_parameters.append(k_parameter)
                 kv_parameters.append(v_parameter)
@@ -278,7 +282,8 @@ def patch_stateful_model(
 def _patch_model_with_openvino(
         pt_model: torch.nn.Module,
         model_config: ModelConfig,
-        kv_cache_dtype: Type):
+        kv_cache_dtype: Type,
+        is_cpu: bool):
     print(' ============= PATCHING MODEL =============')
     from vllm.model_executor.layers.attention.attention import Attention
     from openvino.frontend.pytorch import ModuleExtension
@@ -331,8 +336,12 @@ def _patch_model_with_openvino(
     start_loc = torch.ones(max_batch_size, dtype=torch.long)
     block_tables = torch.ones((max_batch_size, max_num_blocks), dtype=torch.int32)
 
-    kv_cache = [(torch.ones((_EXAMPLE_NUM_BLOCKS, num_kv_heads, head_size // _X, _EXAMPLE_BLOCK_SIZE, _X), dtype=kv_cache_dtype),
-                 torch.ones((_EXAMPLE_NUM_BLOCKS, num_kv_heads, head_size, _EXAMPLE_BLOCK_SIZE), dtype=kv_cache_dtype))] * num_hidden_layers
+    if is_cpu:
+        kv_cache = [(torch.ones((_EXAMPLE_NUM_BLOCKS, num_kv_heads, _EXAMPLE_BLOCK_SIZE, head_size), dtype=kv_cache_dtype),
+                    torch.ones((_EXAMPLE_NUM_BLOCKS, num_kv_heads, _EXAMPLE_BLOCK_SIZE, head_size), dtype=kv_cache_dtype))] * num_hidden_layers
+    else:
+        kv_cache = [(torch.ones((_EXAMPLE_NUM_BLOCKS, num_kv_heads, head_size // _X, _EXAMPLE_BLOCK_SIZE, _X), dtype=kv_cache_dtype),
+                    torch.ones((_EXAMPLE_NUM_BLOCKS, num_kv_heads, head_size, _EXAMPLE_BLOCK_SIZE), dtype=kv_cache_dtype))] * num_hidden_layers
 
     input_meta = {
         "is_prompt": torch.tensor(False),
@@ -461,7 +470,7 @@ def get_model(model_config: ModelConfig,
             # Keep factory to destroy it in a particular moment when all other objects referencing custom nodes are destoyed
             pt_model.ov_node_factory = NodeFactory()
             pt_model.ov_node_factory.add_extension('libuser_ov_extensions.so')
-        patch_stateful_model(pt_model.model, pt_model.ov_node_factory, kv_cache_dtype)
+        patch_stateful_model(pt_model.model, pt_model.ov_node_factory, kv_cache_dtype, device_config.device.type == "cpu")
         core = ov.Core()
         ov_compiled = core.compile_model(pt_model.model, "CPU")
         pt_model._ov_request = ov_compiled.create_infer_request()
@@ -475,6 +484,6 @@ def get_model(model_config: ModelConfig,
     else:
         from vllm.model_executor.model_loader import get_model
         pt_model = get_model(model_config, device_config, **kwargs)
-        _patch_model_with_openvino(pt_model, model_config, kv_cache_dtype)
+        _patch_model_with_openvino(pt_model, model_config, kv_cache_dtype, device_config.device.type == "cpu")
 
     return pt_model

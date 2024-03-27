@@ -60,11 +60,6 @@ class OpenVINOCacheEngine:
         self.num_layers = model_config.get_num_layers(parallel_config)
         self.num_heads = model_config.get_num_kv_heads(parallel_config)
 
-        if device_config.device.type == "cpu":
-            if cache_config.block_size != 1:
-                cache_config.num_cpu_blocks *= cache_config.block_size
-                cache_config.block_size = 1
-                print(f"Warning: CPU only support block_size = 1, it's forced to 1, num_cpu_blocks is set to {cache_config.num_cpu_blocks}.")
         self.block_size = cache_config.block_size
         self.num_gpu_blocks = cache_config.num_gpu_blocks
         self.num_cpu_blocks = cache_config.num_cpu_blocks
@@ -81,6 +76,8 @@ class OpenVINOCacheEngine:
     def get_key_block_shape(self) -> Tuple[int, int, int, int]:
         # TODO: ilavreno: we can insert per-device KV cache shapes configurations
         # which are more optimal for plugins representations
+        if self.device_config.device.type == "cpu":
+            return (self.num_heads, self.block_size, self.head_size)
         element_size = self.cache_dtype.get_size()
         x = 16 // element_size
         return (
@@ -93,6 +90,8 @@ class OpenVINOCacheEngine:
     def get_value_block_shape(self) -> Tuple[int, int, int]:
         # TODO: ilavreno: we can insert per-device KV cache shapes configurations
         # which are more optimal for plugins representations
+        if self.device_config.device.type == "cpu":
+            return (self.num_heads, self.block_size, self.head_size)
         return (
             self.num_heads,
             self.head_size,
@@ -141,10 +140,18 @@ class OpenVINOCacheEngine:
         self._swap(self.gpu_cache, self.cpu_cache, src_to_dst)
 
     def copy(self, src_to_dsts: Dict[int, List[int]]) -> None:
-        key_caches = [key_cache for key_cache, _ in self.gpu_cache]
-        value_caches = [value_cache for _, value_cache in self.gpu_cache]
-        # TODO: ilavreno: implement cache sync via OpenVINO RemoteContext API device -> device copies
-        # cache_ops.copy_blocks(key_caches, value_caches, src_to_dsts)
+        if self.device_config.device.type == "cpu":
+            # TODO: cache_ops.copy_blocks for CPU
+            for src, dsts in src_to_dsts.items():
+                for dst in dsts:
+                    for layer in range(len(self.cpu_cache)):
+                        self.cpu_cache[layer][0].data[dst, :] = self.cpu_cache[layer][0].data[src, :]
+                        self.cpu_cache[layer][1].data[dst, :] = self.cpu_cache[layer][1].data[src, :]
+        else:
+            key_caches = [key_cache for key_cache, _ in self.gpu_cache]
+            value_caches = [value_cache for _, value_cache in self.gpu_cache]
+            # TODO: ilavreno: implement cache sync via OpenVINO RemoteContext API device -> device copies
+            # cache_ops.copy_blocks(key_caches, value_caches, src_to_dsts)
 
     @staticmethod
     def get_cache_dtype(
