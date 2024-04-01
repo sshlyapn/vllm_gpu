@@ -168,7 +168,7 @@ def patch_stateful_model(
                 real_q = mapping[q]
 
                 # takes option that has 4D instead of fine-grained Reshape analysis
-                # it is avoids complication in pattern, but we don't really have many options
+                # it avoids complication in the pattern, but we don't really have many options
                 def take_4d(option1, option2, option3):
                     if option1 in mapping and mapping[option1].get_partial_shape().rank.get_length() == 4:
                         return mapping[option1]
