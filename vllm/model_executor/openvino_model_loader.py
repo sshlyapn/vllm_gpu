@@ -177,8 +177,8 @@ def patch_stateful_model(
                     else:
                         return mapping[option3]
 
-                real_k = take_4d(k_current, k_current2, k_current_reshaped)
-                real_v = take_4d(v_current, v_current2, v_current_reshaped)
+                real_k = take_4d(k_current, k_current_reshaped, k_current2)
+                real_v = take_4d(v_current, v_current_reshaped, v_current2)
                 k_parameter = opset13.parameter(shape=[-1, -1, -1, -1, -1], dtype=kv_cache_dtype)
                 v_parameter = opset13.parameter(shape=[-1, -1, -1, -1], dtype=kv_cache_dtype)
                 kv_parameters.append(k_parameter)
