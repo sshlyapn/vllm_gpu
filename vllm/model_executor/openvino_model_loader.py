@@ -57,10 +57,17 @@ def ov_wrapper(self, *args, **kwargs) -> torch.Tensor:
     self._ov_request.wait()
     return torch.from_numpy(self._ov_request.get_tensor("logits").data)
 
+def arguments_as_outputs(arguments):
+    outputs = []
+    for argument in arguments:
+        if issubclass(type(argument), ov.runtime.Output):
+            outputs.append(argument)
+        else:
+            outputs.extend(argument.outputs())
+    return outputs
 
 def patch_stateful_model(
     model: ov.Model,
-    factory,
     kv_cache_dtype: Type,
     is_cpu: bool):
     print('TRANSFORMING OPTIMUM-INTEL MODEL TO vLLM COMPATIBLE FORM')
@@ -217,7 +224,7 @@ def patch_stateful_model(
                 else:
                     alibi_slopes = opset13.constant(np.array([], np.float32))
 
-                paged_attention = factory.create("PagedAttentionExtension", [
+                paged_attention = ov.runtime.op._PagedAttentionExtension(arguments_as_outputs([
                     q_reshape,
                     k_reshape,
                     v_reshape,
@@ -227,7 +234,7 @@ def patch_stateful_model(
                     scale,
                     alibi_slopes,
                     sliding_window
-                ])
+                ]))
                 pa_shape = opset13.concat([
                         opset13.constant([0]),
                         opset13.constant([0]),
@@ -384,7 +391,7 @@ def _patch_model_with_openvino(
         is_cpu: bool):
     print(' ============= PATCHING MODEL =============')
     from vllm.model_executor.layers.attention.attention import Attention
-    from openvino.frontend.pytorch import ModuleExtension
+    from openvino.frontend.pytorch import ModuleExtension, ConversionExtension
     from openvino import Core, convert_model, Type, PartialShape
 
     # Avoid usage of vllm._C.ops
@@ -488,6 +495,11 @@ def _patch_model_with_openvino(
             torch.tensor(module.backend.sliding_window if module.backend.sliding_window is not None else 0, dtype=torch.int32)  # sliding_window
         )
 
+    def paged_attention_convertion(context):
+        inputs = [context.get_input(i) for i in range(context.get_input_size())]
+        pa = ov.runtime.op._PagedAttentionExtension(inputs)
+        return pa.outputs()
+
     with torch.no_grad():
         print('>>>>>>>>>>>>> CONVERTING OV MODEL')
         ov_model =  convert_model(
@@ -500,7 +512,7 @@ def _patch_model_with_openvino(
                     evaluate=lambda module, *args, **kwargs: args[0],  # need this because PagedAttention module fails in torch.jit.trace
                     convert=wrapper
                 ),
-                "libuser_ov_extensions.so"
+                ConversionExtension('PagedAttentionExtension', paged_attention_convertion),
             ]
         )
 
@@ -593,12 +605,7 @@ def get_model(model_config: ModelConfig,
             compile=False,
             trust_remote_code=model_config.trust_remote_code
         )
-        if not hasattr(pt_model, 'ov_node_factory'):
-            from openvino.runtime.utils.node_factory import NodeFactory
-            # Keep factory to destroy it in a particular moment when all other objects referencing custom nodes are destoyed
-            pt_model.ov_node_factory = NodeFactory()
-            pt_model.ov_node_factory.add_extension('libuser_ov_extensions.so')
-        patch_stateful_model(pt_model.model, pt_model.ov_node_factory, kv_cache_dtype, device_config.device.type == "cpu")
+        patch_stateful_model(pt_model.model, kv_cache_dtype, device_config.device.type == "cpu")
 
         # For deployment outside vLLM
         model_file_name = os.environ.get('VLLM_OPENVINO_EXPORTED_IR_NAME', '')
