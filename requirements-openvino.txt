@@ -15,3 +15,4 @@ ai2-olmo # hf_olmo
 tiktoken
 # flash-attn # // failed to install
 transformers_stream_generator
+bitsandbytes
