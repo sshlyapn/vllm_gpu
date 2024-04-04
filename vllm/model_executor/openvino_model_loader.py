@@ -603,6 +603,7 @@ def get_model(model_config: ModelConfig,
             model_config.model,
             export=export,
             compile=False,
+            load_in_8bit=False,
             trust_remote_code=model_config.trust_remote_code
         )
         patch_stateful_model(pt_model.model, kv_cache_dtype, device_config.device.type == "cpu")
