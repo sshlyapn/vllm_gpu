@@ -9,8 +9,9 @@ RUN apt-get update -y && \
 WORKDIR /workspace
 
 # build and install OpenVINO
-RUN git clone -b feature/optimize_vllm_tput https://github.com/dmitry-gorokhov/openvino.git && \
+RUN git clone https://github.com/openvinotoolkit/openvino.git && \
     cd /workspace/openvino && \
+    git checkout 492699d0fa54ae2b2d2f6ce1b405385665edf2f6 && \
     git submodule update --init -- /workspace/openvino/thirdparty/xbyak \
                                    /workspace/openvino/thirdparty/pugixml \
                                    /workspace/openvino/thirdparty/open_model_zoo \
@@ -24,13 +25,6 @@ RUN cmake -DCPACK_GENERATOR=DEB -DENABLE_PYTHON=ON -DENABLE_PYTHON_PACKAGING=ON 
     -DENABLE_OV_TF_FRONTEND=OFF -DENABLE_OV_ONNX_FRONTEND=OFF -DENABLE_OV_TF_LITE_FRONTEND=OFF -DENABLE_OV_PADDLE_FRONTEND=OFF \
     -S /workspace/openvino -B /workspace/openvino_build
 RUN cmake --build /workspace/openvino_build --parallel 8
-RUN cmake -P /workspace/openvino_build/cmake_install.cmake
-
-# build and install OpenVINO Contrib with PagedAttention
-RUN git clone --branch paged-attention https://github.com/ilya-lavrenov/openvino_contrib.git
-RUN cmake -DCUSTOM_OPERATIONS=paged_attention -DCMAKE_INSTALL_PREFIX=/usr \
-    -S /workspace/openvino_contrib/modules/custom_operations/ -B /workspace/paged_attention_build/
-RUN cmake --build /workspace/paged_attention_build/ --parallel 8
 RUN cmake -P /workspace/openvino_build/cmake_install.cmake
 
 # Install OpenVINO tokenizers
@@ -52,7 +46,6 @@ RUN PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu" python3 -m pip in
 COPY vllm/ /workspace/vllm/vllm
 COPY setup.py /workspace/vllm/
 
-RUN cmake -P /workspace/paged_attention_build/cmake_install.cmake
 RUN python3 -m pip install --no-build-isolation /workspace/vllm/
 #################### EXTENSION Build IMAGE ####################
 
