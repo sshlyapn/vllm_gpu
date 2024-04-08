@@ -309,6 +309,7 @@ class CacheConfig:
         cache_dtype: str,
         sliding_window: Optional[int] = None,
         enable_prefix_caching: bool = False,
+        is_openvino_cpu: bool = False
     ) -> None:
         self.block_size = block_size
         self.gpu_memory_utilization = gpu_memory_utilization
@@ -316,6 +317,7 @@ class CacheConfig:
         self.cache_dtype = cache_dtype
         self.sliding_window = sliding_window
         self.enable_prefix_caching = enable_prefix_caching
+        self.is_openvino_cpu = is_openvino_cpu
         self._verify_args()
         self._verify_cache_dtype()
 
@@ -352,6 +354,10 @@ class CacheConfig:
                 "But it may cause slight accuracy drop. "
                 "Currently we only support fp8 without scaling factors and "
                 "make e5m2 as a default format.")
+        elif self.cache_dtype == "u8":
+            if not self.is_openvino_cpu:
+                raise NotImplementedError(
+                    "U8 KV Cache is only supported on CPU when backend is OpenVINO.")
         else:
             raise ValueError(f"Unknown kv cache dtype: {self.cache_dtype}")
 

@@ -57,6 +57,9 @@ class OpenVINOCacheEngine:
         self.device_config = device_config
 
         self.head_size = model_config.get_head_size()
+        if device_config.device.type == "cpu":
+            if cache_config.cache_dtype == "u8":
+                self.head_size += 8
         self.num_layers = model_config.get_num_layers(parallel_config)
         self.num_heads = model_config.get_num_kv_heads(parallel_config)
 
@@ -185,6 +188,9 @@ class OpenVINOCacheEngine:
         device_config: DeviceConfig,
     ) -> int:
         head_size = model_config.get_head_size()
+        if device_config.device.type == "cpu":
+            if cache_dtype == "u8":
+                head_size += 8
         num_heads = model_config.get_num_kv_heads(parallel_config)
         num_layers = model_config.get_num_layers(parallel_config)
 

@@ -413,6 +413,7 @@ def _patch_model_with_openvino(
         Type.f32: torch.float32,
         Type.f16: torch.float16,
         Type.bf16: torch.bfloat16,
+        Type.u8: torch.uint8,
         Type.i32: torch.int32,
         Type.i64: torch.int64
     }
@@ -521,6 +522,7 @@ def _patch_model_with_openvino(
             torch.float32: Type.f32,
             torch.float16: Type.f16,
             torch.bfloat16: Type.bf16,
+            torch.uint8: Type.u8,
             torch.int32: Type.i32,
             torch.int64: Type.i64
         }

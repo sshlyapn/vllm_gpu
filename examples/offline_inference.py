@@ -11,7 +11,7 @@ sampling_params = SamplingParams(temperature=0.8, top_p=0.95, seed=42, max_token
 model_id = "facebook/opt-125m"
 
 # Create an LLM.
-llm = LLM(model=model_id, device="auto")
+llm = LLM(model=model_id, device="auto", kv_cache_dtype="u8")
 # Generate texts from the prompts. The output is a list of RequestOutput objects
 # that contain the prompt, generated text, and other information.
 outputs = llm.generate(prompts, sampling_params)
