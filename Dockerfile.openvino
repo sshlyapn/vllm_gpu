@@ -28,13 +28,6 @@ RUN cmake -DCPACK_GENERATOR=DEB -DENABLE_PYTHON=ON -DENABLE_PYTHON_PACKAGING=ON 
 RUN cmake --build /workspace/openvino_build --parallel $JOBS
 RUN cmake -P /workspace/openvino_build/cmake_install.cmake
 
-# build and install OpenVINO Contrib with PagedAttention
-RUN git clone --branch paged-attention https://github.com/ilya-lavrenov/openvino_contrib.git
-RUN cmake -DCUSTOM_OPERATIONS=paged_attention -DCMAKE_INSTALL_PREFIX=/usr \
-    -S /workspace/openvino_contrib/modules/custom_operations/ -B /workspace/paged_attention_build/
-RUN cmake --build /workspace/paged_attention_build/ --parallel $JOBS
-RUN cmake -P /workspace/openvino_build/cmake_install.cmake
-
 # Install OpenVINO tokenizers
 RUN PIP_PRE=1 PIP_EXTRA_INDEX_URL="https://storage.openvinotoolkit.org/simple/wheels/nightly" python3 -m pip install openvino-tokenizers
 #################### BASE BUILD IMAGE ####################
