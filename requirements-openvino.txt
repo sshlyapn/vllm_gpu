@@ -7,7 +7,7 @@ pydantic >= 2.0  # Required for OpenAI server.
 prometheus_client >= 0.18.0
 torch >= 2.1.2
 transformers >= 4.38.0  # Required for Gemma.
-openvino==2024.1.0
+openvino>=2024.1.0
 optimum-intel[openvino,nncf] @ git+https://github.com/huggingface/optimum-intel.git@d2f9fdb5107d5df1887f8a4bd138682b73e9f79c
 outlines >= 0.0.27
 einops
