@@ -599,11 +599,12 @@ def get_model(model_config: ModelConfig,
         else:
             print(f'[ INFO ] OpenVINO IR is avaialble for provided model id {model_config.model}. '
                   'This IR will be used for inference as-is, all possible options that may affect model conversion are ignored.')
+        load_in_8bit = None if os.environ.get('VLLM_OPENVINO_ENABLE_QUANTIZED_WEIGHTS', '0') == '1' else False
         pt_model = OVModelForCausalLM.from_pretrained(
             model_config.model,
             export=export,
             compile=False,
-            load_in_8bit=False,
+            load_in_8bit=load_in_8bit,
             trust_remote_code=model_config.trust_remote_code
         )
         patch_stateful_model(pt_model.model, kv_cache_dtype, device_config.device.type == "cpu")
