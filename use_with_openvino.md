@@ -41,7 +41,7 @@ cd benchmarks
 wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
 
 # Install PyPI dependencies (vLLM and aiohttp seem to be enough)
-pip3 install vllm aiohttp
+pip3 install vllm==0.3.3 aiohttp
 
 # Launch benchmark script
 python3 benchmark_serving.py --backend openai --endpoint /v1/completions --port 8000 --model meta-llama/Llama-2-7b-hf --dataset ShareGPT_V3_unfiltered_cleaned_split.json
