@@ -52,7 +52,7 @@ python3 benchmark_serving.py --backend openai --endpoint /v1/completions --port 
 ```
 
 
-## Use vLLM offline 
+## Use vLLM offline
 
 _All below steps assume you are in `vllm` root directory._
 
@@ -82,3 +82,11 @@ docker run --rm -it --entrypoint python3 -v $HOME/.cache/huggingface:/root/.cach
 # --num-prompts <number of requests to send> (default: 1000)
 # --swap-space <GiB for KV cache> (default: 50)
 ```
+
+## Use Int-8 Weights Compression
+
+Weights int-8 compression is disabled by default. For better performance and lesser memory consumption, the weights compression can be enabled by setting the environment variable `VLLM_OPENVINO_ENABLE_QUANTIZED_WEIGHTS=1`.
+To pass the variable in docker, use `-e VLLM_OPENVINO_ENABLE_QUANTIZED_WEIGHTS=1` as an additional argument to `docker run` command in the examples above.
+
+The variable enables weights compression logic described in [optimum-intel 8-bit weights quantization](https://huggingface.co/docs/optimum/intel/optimization_ov#8-bit).
+Hence, even if the variable is enabled, the compression is applied only for models starting with a certain size and avoids compression of too small models due to a significant accuracy drop.
