@@ -1,6 +1,7 @@
 from typing import Dict, List, Optional, Tuple, Set
 import torch.distributed
 import gc
+import os
 
 from vllm.lora.request import LoRARequest
 from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
@@ -57,14 +58,12 @@ class OpenVINOCacheEngine:
         self.device_config = device_config
 
         self.head_size = model_config.get_head_size()
+        if device_config.device.type == "cpu":
+            if cache_config.cache_dtype == "u8":
+                self.head_size += 8
         self.num_layers = model_config.get_num_layers(parallel_config)
         self.num_heads = model_config.get_num_kv_heads(parallel_config)
 
-        if device_config.device.type == "cpu":
-            if cache_config.block_size != 1:
-                cache_config.num_cpu_blocks *= cache_config.block_size
-                cache_config.block_size = 1
-                print(f"Warning: CPU only support block_size = 1, it's forced to 1, num_cpu_blocks is set to {cache_config.num_cpu_blocks}.")
         self.block_size = cache_config.block_size
         self.num_gpu_blocks = cache_config.num_gpu_blocks
         self.num_cpu_blocks = cache_config.num_cpu_blocks
@@ -81,6 +80,8 @@ class OpenVINOCacheEngine:
     def get_key_block_shape(self) -> Tuple[int, int, int, int]:
         # TODO: ilavreno: we can insert per-device KV cache shapes configurations
         # which are more optimal for plugins representations
+        if self.device_config.device.type == "cpu":
+            return (self.num_heads, self.block_size, self.head_size)
         element_size = self.cache_dtype.get_size()
         x = 16 // element_size
         return (
@@ -93,6 +94,8 @@ class OpenVINOCacheEngine:
     def get_value_block_shape(self) -> Tuple[int, int, int]:
         # TODO: ilavreno: we can insert per-device KV cache shapes configurations
         # which are more optimal for plugins representations
+        if self.device_config.device.type == "cpu":
+            return (self.num_heads, self.block_size, self.head_size)
         return (
             self.num_heads,
             self.head_size,
@@ -119,6 +122,9 @@ class OpenVINOCacheEngine:
         for _ in range(self.num_layers):
             key_blocks = ov.Tensor(self.cache_dtype, key_block_shape)
             value_blocks = ov.Tensor(self.cache_dtype, value_block_shape)
+            # force allocation
+            key_blocks.data[:] = 0
+            value_blocks.data[:] = 0
             cpu_cache.append((key_blocks, value_blocks))
         return cpu_cache
 
@@ -138,10 +144,18 @@ class OpenVINOCacheEngine:
         self._swap(self.gpu_cache, self.cpu_cache, src_to_dst)
 
     def copy(self, src_to_dsts: Dict[int, List[int]]) -> None:
-        key_caches = [key_cache for key_cache, _ in self.gpu_cache]
-        value_caches = [value_cache for _, value_cache in self.gpu_cache]
-        # TODO: ilavreno: implement cache sync via OpenVINO RemoteContext API device -> device copies
-        # cache_ops.copy_blocks(key_caches, value_caches, src_to_dsts)
+        if self.device_config.device.type == "cpu":
+            # TODO: cache_ops.copy_blocks for CPU
+            for src, dsts in src_to_dsts.items():
+                for dst in dsts:
+                    for layer in range(len(self.cpu_cache)):
+                        self.cpu_cache[layer][0].data[dst, :] = self.cpu_cache[layer][0].data[src, :]
+                        self.cpu_cache[layer][1].data[dst, :] = self.cpu_cache[layer][1].data[src, :]
+        else:
+            key_caches = [key_cache for key_cache, _ in self.gpu_cache]
+            value_caches = [value_cache for _, value_cache in self.gpu_cache]
+            # TODO: ilavreno: implement cache sync via OpenVINO RemoteContext API device -> device copies
+            # cache_ops.copy_blocks(key_caches, value_caches, src_to_dsts)
 
     @staticmethod
     def get_cache_dtype(
@@ -175,6 +189,9 @@ class OpenVINOCacheEngine:
         device_config: DeviceConfig,
     ) -> int:
         head_size = model_config.get_head_size()
+        if device_config.device.type == "cpu":
+            if cache_dtype == "u8":
+                head_size += 8
         num_heads = model_config.get_num_kv_heads(parallel_config)
         num_layers = model_config.get_num_layers(parallel_config)
 
@@ -433,21 +450,6 @@ class OpenVINOWorker:
         ensure_model_parallel_initialized(self.parallel_config.tensor_parallel_size,
                                           self.parallel_config.pipeline_parallel_size)
 
-    def __del__(self):
-        # TODO: Better to put this code in a wrapper around optimum-based model inside OpenVINO model loader
-        #       but it requires more coding because it should be a full-functional substitution of torch.nn.Module.
-        #       The current solution to put the code here is not robust enough: self.model_runner is not our class instance
-        #       and it can be modified in a way that model is no longer kept as self.model_runner.model attribute.
-        if not (hasattr(self.model_runner, 'model') and hasattr(self.model_runner.model, 'model')):
-            return
-        pt_model = self.model_runner.model
-        if hasattr(pt_model, 'ov_node_factory'):
-            del pt_model._ov_request
-            del pt_model.model
-            if gc: # when app is being destroyed the module may not be available
-                gc.collect()
-            del pt_model.ov_node_factory
-
 
 class OpenVINOExecutor(ExecutorBase):
 
@@ -460,6 +462,8 @@ class OpenVINOExecutor(ExecutorBase):
         device_config: DeviceConfig,
         lora_config: Optional[LoRAConfig],
     ) -> None:
+        if os.environ.get("VLLM_OPENVINO_CPU_KV_CACHE_PRECISION", "") == "u8":
+            cache_config.cache_dtype = "u8"
         self.model_config = model_config
         self.cache_config = cache_config
         self.lora_config = lora_config

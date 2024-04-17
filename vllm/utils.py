@@ -30,6 +30,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "bfloat16": torch.bfloat16,
     "float": torch.float,
     "fp8_e5m2": torch.uint8,
+    "u8": torch.uint8
 }
 
 
@@ -135,6 +136,8 @@ def is_openvino() -> bool:
     return is_openvino_available
 
 def is_openvino_optimum_intel() -> bool:
+    if os.environ.get('VLLM_OPENVINO_OPTIMUM', '1') == '0':
+        return False
     is_optimum_intel_available = is_openvino()
     try:
         import optimum.intel
