@@ -1,6 +1,7 @@
 from typing import Dict, List, Optional, Tuple, Set
 import torch.distributed
 import gc
+import os
 
 from vllm.lora.request import LoRARequest
 from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
@@ -57,6 +58,9 @@ class OpenVINOCacheEngine:
         self.device_config = device_config
 
         self.head_size = model_config.get_head_size()
+        if device_config.device.type == "cpu":
+            if cache_config.cache_dtype == "u8":
+                self.head_size += 8
         self.num_layers = model_config.get_num_layers(parallel_config)
         self.num_heads = model_config.get_num_kv_heads(parallel_config)
 
@@ -185,6 +189,9 @@ class OpenVINOCacheEngine:
         device_config: DeviceConfig,
     ) -> int:
         head_size = model_config.get_head_size()
+        if device_config.device.type == "cpu":
+            if cache_dtype == "u8":
+                head_size += 8
         num_heads = model_config.get_num_kv_heads(parallel_config)
         num_layers = model_config.get_num_layers(parallel_config)
 
@@ -455,6 +462,8 @@ class OpenVINOExecutor(ExecutorBase):
         device_config: DeviceConfig,
         lora_config: Optional[LoRAConfig],
     ) -> None:
+        if os.environ.get("VLLM_OPENVINO_CPU_KV_CACHE_PRECISION", "") == "u8":
+            cache_config.cache_dtype = "u8"
         self.model_config = model_config
         self.cache_config = cache_config
         self.lora_config = lora_config
