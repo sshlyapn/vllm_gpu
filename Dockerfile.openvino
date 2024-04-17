@@ -1,9 +1,8 @@
 # The vLLM Dockerfile is used to construct vLLM image that can be directly used
 # to run the OpenAI compatible server.
+
 #################### BASE BUILD IMAGE ####################
 FROM ubuntu:22.04 AS dev
-
-ARG JOBS
 
 RUN apt-get update -y && \
     apt-get install -y python3-pip git
@@ -21,11 +20,11 @@ RUN git clone https://github.com/openvinotoolkit/openvino.git && \
     cd -
 RUN /workspace/openvino/install_build_dependencies.sh
 RUN python3 -m pip install -r /workspace/openvino/src/bindings/python/wheel/requirements-dev.txt
-RUN cmake -DCPACK_GENERATOR=DEB -DENABLE_PYTHON=ON -DENABLE_PYTHON_PACKAGING=ON -DENABLE_WHEEL=ON -DENABLE_CPPLINT=OFF -DENABLE_SAMPLES=OFF \
+RUN cmake -DCPACK_GENERATOR=DEB -DENABLE_PYTHON=ON -DENABLE_PYTHON_PACKAGING=ON -DENABLE_CPPLINT=OFF -DENABLE_SAMPLES=OFF \
     -DENABLE_INTEL_GPU=OFF -DENABLE_INTEL_NPU=OFF -DENABLE_TEMPLATE=OFF -DENABLE_AUTO=OFF -DENABLE_HETERO=OFF -DENABLE_AUTO_BATCH=OFF \
     -DENABLE_OV_TF_FRONTEND=OFF -DENABLE_OV_ONNX_FRONTEND=OFF -DENABLE_OV_TF_LITE_FRONTEND=OFF -DENABLE_OV_PADDLE_FRONTEND=OFF \
     -S /workspace/openvino -B /workspace/openvino_build
-RUN cmake --build /workspace/openvino_build --parallel $JOBS
+RUN cmake --build /workspace/openvino_build --parallel 8
 RUN cmake -P /workspace/openvino_build/cmake_install.cmake
 
 # Install OpenVINO tokenizers
@@ -48,15 +47,6 @@ COPY vllm/ /workspace/vllm/vllm
 COPY setup.py /workspace/vllm/
 
 RUN python3 -m pip install --no-build-isolation /workspace/vllm/
-
-# prepare artifacts to install outside docker
-RUN python3 -m pip install build && \
-    python3 -m build --wheel --no-isolation /workspace/vllm/ && \
-    mkdir -p artifacts/wheels/openvino artifacts/wheels/vllm artifacts/lib  && \
-    cp /workspace/openvino_build/wheels/* /workspace/artifacts/wheels/openvino/ && \
-    cp /workspace/vllm/dist/* /workspace/artifacts/wheels/vllm/ && \
-    cp /workspace/paged_attention_build/user_ie_extensions/libuser_ov_extensions.so artifacts/lib/
-
 #################### EXTENSION Build IMAGE ####################
 
 
