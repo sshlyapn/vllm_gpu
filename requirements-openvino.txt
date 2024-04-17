@@ -6,7 +6,7 @@ uvicorn[standard]
 pydantic >= 2.0  # Required for OpenAI server.
 prometheus_client >= 0.18.0
 torch >= 2.1.2
-transformers >= 4.38.0  # Required for Gemma.
+transformers >= 4.39.0  # Required for Gemma.
 openvino>=2024.1.0
 optimum-intel[openvino,nncf] @ git+https://github.com/huggingface/optimum-intel.git@ff5d185738d2f5f93dc609870474b205d8136b99
 outlines >= 0.0.27
