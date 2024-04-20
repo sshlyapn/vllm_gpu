@@ -85,6 +85,8 @@ docker run --rm -it --entrypoint python3 -v $HOME/.cache/huggingface:/root/.cach
 
 ## Use Int-8 Weights Compression
 
+(Note: for debugging purposes the default value for the variable described below `VLLM_OPENVINO_ENABLE_QUANTIZED_WEIGHTS=1`. Set it to `0` to have better accuracy results. Remove this note before creating vLLM PR).
+
 Weights int-8 compression is disabled by default. For better performance and lesser memory consumption, the weights compression can be enabled by setting the environment variable `VLLM_OPENVINO_ENABLE_QUANTIZED_WEIGHTS=1`.
 To pass the variable in docker, use `-e VLLM_OPENVINO_ENABLE_QUANTIZED_WEIGHTS=1` as an additional argument to `docker run` command in the examples above.
 
