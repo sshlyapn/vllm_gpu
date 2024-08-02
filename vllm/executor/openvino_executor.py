@@ -3,6 +3,7 @@ from typing import List, Set, Tuple
 import openvino as ov
 import openvino.properties.hint as hints
 import torch
+import os
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, ModelConfig
@@ -142,24 +143,36 @@ def _verify_and_get_model_config(config: ModelConfig) -> ModelConfig:
 
 
 def _verify_and_get_cache_config(config: CacheConfig) -> CacheConfig:
+    ov_device = os.getenv("OV_DEVICE", "CPU")
+
     if envs.VLLM_OPENVINO_CPU_KV_CACHE_PRECISION == "u8":
         logger.info("KV cache type is overried to u8 via "
                     "VLLM_OPENVINO_CPU_KV_CACHE_PRECISION env var.")
         config.cache_dtype = ov.Type.u8
     else:
-        core = ov.Core()
-        inference_precision = core.get_property("CPU",
-                                                hints.inference_precision)
-        if inference_precision == ov.Type.bf16:
-            config.cache_dtype = ov.Type.bf16
+        if "CPU" in ov_device:
+            core = ov.Core()
+            inference_precision = core.get_property("CPU",
+                                                    hints.inference_precision)
+            if inference_precision == ov.Type.bf16:
+                config.cache_dtype = ov.Type.bf16
+            else:
+                config.cache_dtype = ov.Type.f16
         else:
             config.cache_dtype = ov.Type.f16
 
-    if config.block_size != 32:
-        logger.info(
-            f"OpenVINO optimal block size is 32, overriding currently set {config.block_size}"  # noqa: G004, E501
-        )
-        config.block_size = 32
+    if "CPU" in ov_device:
+        if config.block_size != 32:
+            logger.info(
+                f"OpenVINO optimal block size is 32, overriding currently set {config.block_size}"  # noqa: G004, E501
+            )
+            config.block_size = 32
+    elif "GPU" in ov_device:
+        if config.block_size != 16:
+            logger.info(
+                f"OpenVINO optimal block size is 16, overriding currently set {config.block_size}"  # noqa: G004, E501
+            )
+            config.block_size = 16
 
     kv_cache_space = envs.VLLM_OPENVINO_KVCACHE_SPACE
     if kv_cache_space >= 0:

@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import openvino as ov
 import torch
+import os
 import torch.distributed
 
 from vllm.attention import get_attn_backend
@@ -35,6 +36,7 @@ class OpenVINOCacheEngine:
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
         device_config: DeviceConfig,
+        ov_core: ov.Core
     ) -> None:
         assert device_config.device_type == "openvino"
         self.cache_config = cache_config
@@ -73,22 +75,45 @@ class OpenVINOCacheEngine:
         # Initialize the cache.
         self.kv_cache: List[Tuple[ov.Tensor,
                                   ov.Tensor]] = self._allocate_kv_cache(
-                                      self.num_cpu_blocks)
+                                      self.num_cpu_blocks,
+                                      ov_core)
 
     def _allocate_kv_cache(
         self,
         num_blocks: int,
+        ov_core: ov.Core
     ) -> List[Tuple[ov.Tensor, ov.Tensor]]:
         """Allocates KV cache."""
         k_block_shape = v_block_shape = self.attn_backend.get_kv_cache_shape(
             num_blocks, self.block_size, self.num_kv_heads, self.head_size)[1:]
+
         kv_cache: List[Tuple[ov.Tensor, ov.Tensor]] = []
-        for _ in range(self.num_layers):
-            key_blocks = ov.Tensor(self.cache_config.cache_dtype,
-                                   k_block_shape)
-            value_blocks = ov.Tensor(self.cache_config.cache_dtype,
-                                     v_block_shape)
-            kv_cache.append((key_blocks, value_blocks))
+
+        ov_device = os.getenv("OV_DEVICE", "CPU")
+        if "CPU" in ov_device:
+            for _ in range(self.num_layers):
+                key_blocks = ov.Tensor(self.cache_config.cache_dtype,
+                                    k_block_shape)
+                value_blocks = ov.Tensor(self.cache_config.cache_dtype,
+                                        v_block_shape)
+                kv_cache.append((key_blocks, value_blocks))
+        else:
+            v_block_shape = (v_block_shape[0], v_block_shape[1], v_block_shape[3], v_block_shape[2])
+
+            for _ in range(self.num_layers):
+                use_remote = os.getenv("REMOTE", "1")
+                if use_remote == "1":
+                    remote_context = ov_core.get_default_context(ov_device)
+                    key_blocks = remote_context.create_tensor(self.cache_config.cache_dtype, ov.Shape(k_block_shape), {})
+                    value_blocks = remote_context.create_tensor(self.cache_config.cache_dtype, ov.Shape(v_block_shape), {})
+                    kv_cache.append((key_blocks, value_blocks))
+                else:
+                    key_blocks = ov.Tensor(self.cache_config.cache_dtype,
+                                        k_block_shape)
+                    value_blocks = ov.Tensor(self.cache_config.cache_dtype,
+                                            v_block_shape)
+                    kv_cache.append((key_blocks, value_blocks))
+
         return kv_cache
 
     def swap_in(self, src_to_dst: Dict[int, int]) -> None:
@@ -267,6 +292,7 @@ class OpenVINOWorker(LoraNotSupportedWorkerBase):
             self.model_config,
             self.parallel_config,
             self.device_config,
+            self.model_runner.model.ov_core,
         )
         self.kv_cache = self.cache_engine.kv_cache
         self.model_runner.block_size = self.cache_engine.block_size
@@ -274,9 +300,11 @@ class OpenVINOWorker(LoraNotSupportedWorkerBase):
         assert self.kv_cache is not None
 
         # Populate the cache to warmup the memory
-        for key_cache, value_cache in self.kv_cache:
-            key_cache.data[:] = 0
-            value_cache.data[:] = 0
+        ov_device = os.getenv("OV_DEVICE", "CPU")
+        if "CPU" in ov_device:
+            for key_cache, value_cache in self.kv_cache:
+                key_cache.data[:] = 0
+                value_cache.data[:] = 0
 
     def cache_copy(
         self,

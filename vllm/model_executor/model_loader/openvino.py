@@ -2,6 +2,7 @@
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+import os
 import openvino as ov
 import torch
 from huggingface_hub import HfApi
@@ -18,6 +19,8 @@ from vllm.model_executor.layers.logits_processor import (LogitsProcessor,
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import SamplerOutput
+
+from openvino.runtime import get_version
 
 logger = init_logger(__name__)
 
@@ -42,6 +45,8 @@ def _flattenize_inputs(inputs):
 
 def _modify_cache_parameters(model: ov.Model, kv_cache_dtype: ov.Type,
                              is_cpu: bool):
+    key_cache_printed = False
+    value_cache_printed = False
     # Apply hardware dependent modifications to KV tensors
     for parameter in model.get_parameters():
         input = parameter.get_output_tensor(0)
@@ -59,18 +64,21 @@ def _modify_cache_parameters(model: ov.Model, kv_cache_dtype: ov.Type,
         # TODO: Negotiate required layout with plugins (CPU is ~OK, GPU is TBD),
         # pass more parameters to this function to set more static dimensions
         if input_name.startswith("key_cache."):
-            cpu_shape = [num_blocks, shape[1], block_size, head_size]
-            gpu_shape = [
-                num_blocks,
-                shape[1],
-                shape[2].get_length() //
-                x_size if shape[2].is_static else ov.Dimension(),
-                block_size,
-                x_size,
-            ]
-        elif input_name.startswith("value_cache."):
+            if not key_cache_printed:
+                print(f"key_cache shape: {shape}; num_heads={shape[1]}, head_size={shape[2]}")
+                key_cache_printed = True
+
             cpu_shape = [num_blocks, shape[1], block_size, head_size]
             gpu_shape = [num_blocks, shape[1], shape[2], block_size]
+        elif input_name.startswith("value_cache."):
+            if not value_cache_printed:
+                print(f"value_cache shape: {shape}; num_heads={shape[1]}, head_size={shape[2]}")
+                value_cache_printed = True
+
+            cpu_shape = [num_blocks, shape[1], block_size, head_size]
+            # cpu_shape = [num_blocks, shape[1], block_size, head_size]
+            gpu_shape = [num_blocks, shape[1], block_size, shape[2]]
+            # gpu_shape = [num_blocks, shape[1], shape[2], block_size]
         else:
             continue
         parameter.set_partial_shape(
@@ -142,13 +150,18 @@ class OpenVINOCasualLM(nn.Module):
             trust_remote_code=model_config.trust_remote_code,
         )
 
+        ov_device = os.getenv("OV_DEVICE", "CPU")
+
+        print("OpenVINO version:", get_version())
+        print("OpenVINO device:", ov_device)
         paged_attention_transformation(pt_model.model)
         _modify_cache_parameters(pt_model.model, kv_cache_dtype,
-                                 device_config.device.type == "cpu")
+                                 "CPU" in ov_device)
 
         core = ov.Core()
-        ov_compiled = core.compile_model(pt_model.model, "CPU")
+        ov_compiled = core.compile_model(pt_model.model, ov_device)
         self.ov_request = ov_compiled.create_infer_request()
+        self.ov_core = core
 
     def forward(
         self,

@@ -3,6 +3,7 @@ from typing import List, Tuple
 
 import openvino as ov
 import torch
+import os
 
 from vllm.attention.backends.abstract import (AttentionBackend,
                                               AttentionMetadata)
@@ -35,7 +36,11 @@ class OpenVINOAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
     ) -> Tuple[int, ...]:
-        return (2, num_blocks, num_kv_heads, block_size, head_size)
+        ov_device = os.getenv("OV_DEVICE", "CPU")
+        if "CPU" in ov_device:
+            return (2, num_blocks, num_kv_heads, block_size, head_size)
+        else:
+            return (2, num_blocks, num_kv_heads, head_size, block_size)
 
     @staticmethod
     def swap_blocks(
