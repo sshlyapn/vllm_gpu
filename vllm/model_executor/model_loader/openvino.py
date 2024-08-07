@@ -117,6 +117,7 @@ class OpenVINOCasualLM(nn.Module):
 
     def __init__(
         self,
+        ov_core: ov.Core,
         model_config: ModelConfig,
         device_config: DeviceConfig,
         kv_cache_dtype: ov.Type,
@@ -158,10 +159,8 @@ class OpenVINOCasualLM(nn.Module):
         _modify_cache_parameters(pt_model.model, kv_cache_dtype,
                                  "CPU" in ov_device)
 
-        core = ov.Core()
-        ov_compiled = core.compile_model(pt_model.model, ov_device)
+        ov_compiled = ov_core.compile_model(pt_model.model, ov_device)
         self.ov_request = ov_compiled.create_infer_request()
-        self.ov_core = core
 
     def forward(
         self,
@@ -213,6 +212,7 @@ def get_model(
     **kwargs,
 ) -> torch.nn.Module:
     lora_config = kwargs.get("lora_config", None)
+    ov_core = kwargs.get("ov_core")
     if lora_config:
         raise ValueError(
             "OpenVINO modeling does not support LoRA, "
@@ -220,4 +220,4 @@ def get_model(
             "be added in the future. If this is important to you, "
             "please open an issue on github.")
 
-    return OpenVINOCasualLM(model_config, device_config, kv_cache_dtype)
+    return OpenVINOCasualLM(ov_core, model_config, device_config, kv_cache_dtype)

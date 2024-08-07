@@ -41,6 +41,7 @@ class OpenVINOModelRunner:
 
     def __init__(
         self,
+        ov_core : ov.Core,
         model_config: ModelConfig,
         parallel_config: ParallelConfig,
         scheduler_config: SchedulerConfig,
@@ -54,6 +55,7 @@ class OpenVINOModelRunner:
         *args,
         **kwargs,
     ):
+        self.ov_core = ov_core
         self.model_config = model_config
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
@@ -92,6 +94,7 @@ class OpenVINOModelRunner:
             model_config=self.model_config,
             device_config=self.device_config,
             kv_cache_dtype=self.kv_cache_dtype,
+            ov_core=self.ov_core
         )
 
     def _prepare_model_input(

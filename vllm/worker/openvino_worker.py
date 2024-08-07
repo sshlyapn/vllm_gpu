@@ -193,12 +193,15 @@ class OpenVINOWorker(LoraNotSupportedWorkerBase):
         if self.is_driver_worker:
             assert self.rank == 0, "The driver worker must have rank 0."
 
+        self.ov_core = ov.Core()
+
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
 
             init_cached_hf_modules()
         self.model_runner = OpenVINOModelRunner(
+            self.ov_core,
             model_config,
             parallel_config,
             scheduler_config,
@@ -292,7 +295,7 @@ class OpenVINOWorker(LoraNotSupportedWorkerBase):
             self.model_config,
             self.parallel_config,
             self.device_config,
-            self.model_runner.model.ov_core,
+            self.ov_core,
         )
         self.kv_cache = self.cache_engine.kv_cache
         self.model_runner.block_size = self.cache_engine.block_size
