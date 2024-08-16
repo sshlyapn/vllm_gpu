@@ -4,6 +4,7 @@ from typing import List, Tuple, Type
 import openvino as ov
 import torch
 
+import vllm.envs as envs
 from vllm.attention.backends.abstract import (AttentionBackend,
                                               AttentionMetadata)
 from vllm.attention.backends.utils import CommonAttentionState
@@ -40,7 +41,10 @@ class OpenVINOAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
     ) -> Tuple[int, ...]:
-        return (2, num_blocks, num_kv_heads, block_size, head_size)
+        if "CPU" in envs.VLLM_OPENVINO_DEVICE:
+            return (2, num_blocks, num_kv_heads, block_size, head_size)
+        else:
+            return (2, num_blocks, num_kv_heads, head_size, block_size)
 
     @staticmethod
     def swap_blocks(
@@ -48,9 +52,29 @@ class OpenVINOAttentionBackend(AttentionBackend):
         dst_kv_cache: ov.Tensor,
         src_to_dst: torch.Tensor,
     ) -> None:
-        # OpenVINO currently supports only CPU, which does not require
-        # swap of KV cache blocks
-        raise NotImplementedError
+        begin_roi = ov.runtime.Coordinate([0, 0, 0, 0])
+        end_roi = ov.runtime.Coordinate(src_kv_cache.get_shape())
+
+        def get_roi_tensor(tensor, block_number):
+            roi_begin = ov.runtime.Coordinate(begin_roi)
+            roi_end = ov.runtime.Coordinate(end_roi)
+            roi_begin[0] = block_number
+            roi_end[0] = block_number + 1
+
+            if isinstance(tensor, ov.Tensor):
+                return ov.Tensor(tensor, roi_begin, roi_end)
+            else:
+                return ov.RemoteTensor(tensor, roi_begin, roi_end)
+
+        num_blocks = src_to_dst.size(0)
+        for i in range(num_blocks):
+            src_block_number = src_to_dst[i, 0].item()
+            dst_block_number = src_to_dst[i, 1].item()
+
+            src_roi_tensor = get_roi_tensor(src_kv_cache, src_block_number)
+            dst_roi_tensor = get_roi_tensor(dst_kv_cache, dst_block_number)
+            src_roi_tensor.copy_to(dst_roi_tensor)
+
 
     @staticmethod
     def copy_blocks(
