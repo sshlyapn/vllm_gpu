@@ -10,6 +10,34 @@ from vllm.attention.backends.abstract import (AttentionBackend,
 from vllm.attention.backends.utils import CommonAttentionState
 
 
+def copy_cache_block(
+    src_tensor: ov.Tensor,
+    dst_tensor: ov.Tensor,
+    src_offset: int,
+    dst_offset: int) -> None:
+
+    def create_roi_tensor(
+        tensor: ov.Tensor,
+        block_number: int,
+        ) -> ov.Tensor:
+        roi_begin = ov.runtime.Coordinate([0, 0, 0, 0])
+        roi_end = ov.runtime.Coordinate(tensor.get_shape())
+
+        roi_begin[0] = block_number
+        roi_end[0] = block_number + 1
+
+        if isinstance(tensor, ov.Tensor):
+            return ov.Tensor(tensor, roi_begin, roi_end)
+        else:
+            return ov.RemoteTensor(tensor, roi_begin, roi_end)
+
+    src_roi_tensor = \
+        create_roi_tensor(src_tensor, src_offset)
+    dst_roi_tensor = \
+        create_roi_tensor(dst_tensor, dst_offset)
+    src_roi_tensor.copy_to(dst_roi_tensor)
+
+
 class OpenVINOAttentionBackend(AttentionBackend):
 
     @staticmethod
@@ -48,32 +76,12 @@ class OpenVINOAttentionBackend(AttentionBackend):
 
     @staticmethod
     def swap_blocks(
-        src_kv_cache: ov.Tensor,
-        dst_kv_cache: ov.Tensor,
-        src_to_dst: torch.Tensor,
+        src_tensor: ov.Tensor,
+        dst_tensor: ov.Tensor,
+        src_to_dists: List[Tuple[int, int]],
     ) -> None:
-        begin_roi = ov.runtime.Coordinate([0, 0, 0, 0])
-        end_roi = ov.runtime.Coordinate(src_kv_cache.get_shape())
-
-        def get_roi_tensor(tensor, block_number):
-            roi_begin = ov.runtime.Coordinate(begin_roi)
-            roi_end = ov.runtime.Coordinate(end_roi)
-            roi_begin[0] = block_number
-            roi_end[0] = block_number + 1
-
-            if isinstance(tensor, ov.Tensor):
-                return ov.Tensor(tensor, roi_begin, roi_end)
-            else:
-                return ov.RemoteTensor(tensor, roi_begin, roi_end)
-
-        num_blocks = src_to_dst.size(0)
-        for i in range(num_blocks):
-            src_block_number = src_to_dst[i, 0].item()
-            dst_block_number = src_to_dst[i, 1].item()
-
-            src_roi_tensor = get_roi_tensor(src_kv_cache, src_block_number)
-            dst_roi_tensor = get_roi_tensor(dst_kv_cache, dst_block_number)
-            src_roi_tensor.copy_to(dst_roi_tensor)
+        for src, dst in src_to_dists:
+            copy_cache_block(src_tensor, dst_tensor, src, dst)
 
 
     @staticmethod
@@ -83,9 +91,8 @@ class OpenVINOAttentionBackend(AttentionBackend):
     ) -> None:
         for src, dst in src_to_dists:
             for key_cache, value_cache in kv_caches:
-                key_cache.data[dst, :] = key_cache.data[src, :]
-                value_cache.data[dst, :] = value_cache.data[src, :]
-
+                copy_cache_block(key_cache, key_cache, src, dst)
+                copy_cache_block(value_cache, value_cache, src, dst)
 
 @dataclass
 class OpenVINOAttentionMetadata:

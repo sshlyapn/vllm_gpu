@@ -70,10 +70,12 @@ class OpenVINOExecutor(ExecutorBase):
         # NOTE: We log here to avoid multiple logs when number of workers is
         # greater than one. We could log in the engine, but not all executors
         # have GPUs.
-        # NOTE: `cpu block` for OpenVINO backend is located on CPU memory but is
-        # referred as `gpu block`. Because we want to reuse the existing block
-        # management procedure.
-        logger.info("# %s blocks: %d", envs.VLLM_OPENVINO_DEVICE, num_gpu_blocks)
+        # NOTE: In case of a CPU device, `cpu block` for OpenVINO backend
+        # is located on CPU memory but is referred as `gpu block`.
+        # Because we want to reuse the existing block management procedure.
+        device_blocks = num_gpu_blocks
+        swap_blocks = num_cpu_blocks
+        logger.info("OpenVINO %s: # device blocks: %d; # swap blocks: %d", envs.VLLM_OPENVINO_DEVICE, device_blocks, swap_blocks)
         self.driver_worker.initialize_cache(num_gpu_blocks, num_cpu_blocks)
 
     def execute_model(
@@ -149,7 +151,8 @@ def _verify_and_get_cache_config(ov_core: ov.Core, config: CacheConfig) -> Cache
     ov_device = envs.VLLM_OPENVINO_DEVICE
     if envs.VLLM_OPENVINO_CPU_KV_CACHE_PRECISION == "u8":
         if "GPU" in ov_device:
-            logger.info("VLLM_OPENVINO_CPU_KV_CACHE_PRECISION is ignored for GPU.")
+            logger.info("VLLM_OPENVINO_CPU_KV_CACHE_PRECISION is ignored for GPU, "
+                        "f16 data type will be used.")
         else:
             logger.info("KV cache type is overried to u8 via "
                         "VLLM_OPENVINO_CPU_KV_CACHE_PRECISION env var.")
@@ -180,7 +183,7 @@ def _verify_and_get_cache_config(ov_core: ov.Core, config: CacheConfig) -> Cache
 
     kv_cache_space = envs.VLLM_OPENVINO_KVCACHE_SPACE
     if kv_cache_space >= 0:
-        if kv_cache_space == 0:
+        if kv_cache_space == 0 and "CPU" in ov_device:
             config.openvino_kvcache_space_bytes = 4 * GiB_bytes  # type: ignore
             logger.warning(
                 "Environment variable VLLM_OPENVINO_KVCACHE_SPACE (GB) "

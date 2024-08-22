@@ -52,12 +52,9 @@ def _modify_cache_parameters(model: ov.Model, kv_cache_dtype: ov.Type,
         shape = parameter.get_partial_shape()
         # use real block size if available, just a placeholder
         # to provide the expected rank
-        x_size = 1
         num_blocks = ov.Dimension()
         block_size = ov.Dimension()
         head_size = ov.Dimension()
-        # TODO: Negotiate required layout with plugins (CPU is ~OK, GPU is TBD),
-        # pass more parameters to this function to set more static dimensions
         if input_name.startswith("key_cache."):
             cpu_shape = [num_blocks, shape[1], block_size, head_size]
             gpu_shape = [num_blocks, shape[1], shape[2], block_size]
