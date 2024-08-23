@@ -135,7 +135,8 @@ class OpenVINOCasualLM(nn.Module):
 
         ov_device = envs.VLLM_OPENVINO_DEVICE
         paged_attention_transformation(pt_model.model)
-        _modify_cache_parameters(pt_model.model, kv_cache_dtype, "CPU" in ov_device)
+        _modify_cache_parameters(pt_model.model, kv_cache_dtype, "CPU"
+                                 in ov_device)
 
         ov_compiled = ov_core.compile_model(pt_model.model, ov_device)
         self.ov_request = ov_compiled.create_infer_request()
@@ -198,4 +199,5 @@ def get_model(
             "be added in the future. If this is important to you, "
             "please open an issue on github.")
 
-    return OpenVINOCasualLM(ov_core, model_config, device_config, kv_cache_dtype)
+    return OpenVINOCasualLM(ov_core, model_config, device_config,
+                            kv_cache_dtype)

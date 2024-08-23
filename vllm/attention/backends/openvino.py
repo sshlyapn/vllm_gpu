@@ -10,16 +10,13 @@ from vllm.attention.backends.abstract import (AttentionBackend,
 from vllm.attention.backends.utils import CommonAttentionState
 
 
-def copy_cache_block(
-    src_tensor: ov.Tensor,
-    dst_tensor: ov.Tensor,
-    src_offset: int,
-    dst_offset: int) -> None:
+def copy_cache_block(src_tensor: ov.Tensor, dst_tensor: ov.Tensor,
+                     src_offset: int, dst_offset: int) -> None:
 
     def create_roi_tensor(
         tensor: ov.Tensor,
         block_number: int,
-        ) -> ov.Tensor:
+    ) -> ov.Tensor:
         roi_begin = ov.runtime.Coordinate([0, 0, 0, 0])
         roi_end = ov.runtime.Coordinate(tensor.get_shape())
 
@@ -83,7 +80,6 @@ class OpenVINOAttentionBackend(AttentionBackend):
         for src, dst in src_to_dists:
             copy_cache_block(src_tensor, dst_tensor, src, dst)
 
-
     @staticmethod
     def copy_blocks(
         kv_caches: List[Tuple[ov.Tensor, ov.Tensor]],
@@ -93,6 +89,7 @@ class OpenVINOAttentionBackend(AttentionBackend):
             for key_cache, value_cache in kv_caches:
                 copy_cache_block(key_cache, key_cache, src, dst)
                 copy_cache_block(value_cache, value_cache, src, dst)
+
 
 @dataclass
 class OpenVINOAttentionMetadata:

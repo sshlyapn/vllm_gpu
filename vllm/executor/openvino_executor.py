@@ -25,8 +25,8 @@ class OpenVINOExecutor(ExecutorBase):
         assert self.lora_config is None, "OpenVINO backend doesn't support LoRA"
         self.ov_core = ov.Core()
         self.model_config = _verify_and_get_model_config(self.model_config)
-        self.cache_config = _verify_and_get_cache_config(self.ov_core,
-                                                         self.cache_config)
+        self.cache_config = _verify_and_get_cache_config(
+            self.ov_core, self.cache_config)
 
         # Instantiate the worker and load the model to CPU.
         self._init_worker()
@@ -75,7 +75,8 @@ class OpenVINOExecutor(ExecutorBase):
         # Because we want to reuse the existing block management procedure.
         device_blocks = num_gpu_blocks
         swap_blocks = num_cpu_blocks
-        logger.info("OpenVINO %s: # device blocks: %d; # swap blocks: %d", envs.VLLM_OPENVINO_DEVICE, device_blocks, swap_blocks)
+        logger.info("OpenVINO %s: # device blocks: %d; # swap blocks: %d",
+                    envs.VLLM_OPENVINO_DEVICE, device_blocks, swap_blocks)
         self.driver_worker.initialize_cache(num_gpu_blocks, num_cpu_blocks)
 
     def execute_model(
@@ -147,20 +148,21 @@ def _verify_and_get_model_config(config: ModelConfig) -> ModelConfig:
     return config
 
 
-def _verify_and_get_cache_config(ov_core: ov.Core, config: CacheConfig) -> CacheConfig:
+def _verify_and_get_cache_config(ov_core: ov.Core,
+                                 config: CacheConfig) -> CacheConfig:
     ov_device = envs.VLLM_OPENVINO_DEVICE
     if envs.VLLM_OPENVINO_CPU_KV_CACHE_PRECISION == "u8":
         if "GPU" in ov_device:
-            logger.info("VLLM_OPENVINO_CPU_KV_CACHE_PRECISION is ignored for GPU, "
-                        "f16 data type will be used.")
+            logger.info("VLLM_OPENVINO_CPU_KV_CACHE_PRECISION is"
+                        "ignored for GPU, f16 data type will be used.")
         else:
             logger.info("KV cache type is overried to u8 via "
                         "VLLM_OPENVINO_CPU_KV_CACHE_PRECISION env var.")
             config.cache_dtype = ov.Type.u8
     else:
         if "CPU" in ov_device:
-            inference_precision = ov_core.get_property(ov_device,
-                                                       hints.inference_precision)
+            inference_precision = ov_core.get_property(
+                ov_device, hints.inference_precision)
             if inference_precision == ov.Type.bf16:
                 config.cache_dtype = ov.Type.bf16
             else:
@@ -174,7 +176,7 @@ def _verify_and_get_cache_config(ov_core: ov.Core, config: CacheConfig) -> Cache
                 f"OpenVINO optimal block size is 32, overriding currently set {config.block_size}"  # noqa: G004, E501
             )
             config.block_size = 32
-    elif "GPU" in ov_device:
+    else:
         if config.block_size != 16:
             logger.info(
                 f"OpenVINO optimal block size is 16, overriding currently set {config.block_size}"  # noqa: G004, E501
