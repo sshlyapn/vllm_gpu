@@ -156,7 +156,7 @@ def _verify_and_get_cache_config(ov_core: ov.Core,
             logger.info("VLLM_OPENVINO_CPU_KV_CACHE_PRECISION is"
                         "ignored for GPU, f16 data type will be used.")
         else:
-            logger.info("KV cache type is overried to u8 via "
+            logger.info("KV cache type is overridden to u8 via "
                         "VLLM_OPENVINO_CPU_KV_CACHE_PRECISION env var.")
             config.cache_dtype = ov.Type.u8
     else:

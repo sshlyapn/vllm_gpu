@@ -4,7 +4,6 @@ from typing import List, Tuple, Type
 import openvino as ov
 import torch
 
-import vllm.envs as envs
 from vllm.attention.backends.abstract import (AttentionBackend,
                                               AttentionMetadata)
 from vllm.attention.backends.utils import CommonAttentionState
@@ -66,10 +65,7 @@ class OpenVINOAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
     ) -> Tuple[int, ...]:
-        if "CPU" in envs.VLLM_OPENVINO_DEVICE:
-            return (2, num_blocks, num_kv_heads, block_size, head_size)
-        else:
-            return (2, num_blocks, num_kv_heads, head_size, block_size)
+        return (2, num_blocks, num_kv_heads, block_size, head_size)
 
     @staticmethod
     def swap_blocks(

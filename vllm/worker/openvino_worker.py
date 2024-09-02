@@ -108,9 +108,9 @@ class OpenVINOCacheEngine:
                                          v_block_shape)
                 kv_cache.append((key_blocks, value_blocks))
         else:
-            # Update value_cache shape:
-            v_block_shape = (k_block_shape[0], k_block_shape[1],
-                             k_block_shape[3], k_block_shape[2])
+            # Update key_cache shape:
+            k_block_shape = (v_block_shape[0], v_block_shape[1],
+                             v_block_shape[3], v_block_shape[2])
 
             remote_context = ov_core.get_default_context(ov_device)
 
@@ -145,9 +145,9 @@ class OpenVINOCacheEngine:
         assert "CPU" not in ov_device, \
             "CPU device isn't supposed to have swap cache"
 
-        # Update value_cache shape:
-        v_block_shape = (k_block_shape[0], k_block_shape[1], k_block_shape[3],
-                         k_block_shape[2])
+        # Update key_cache shape:
+        k_block_shape = (v_block_shape[0], v_block_shape[1], v_block_shape[3],
+                         v_block_shape[2])
 
         for _ in range(self.num_layers):
             key_blocks = ov.Tensor(self.cache_config.cache_dtype,
@@ -280,11 +280,6 @@ class OpenVINOWorker(LoraNotSupportedWorkerBase):
 
         This determines how many KV blocks can fit into the configured
         KV cache space.
-
-        Note that since vLLM assumes a block resides on GPU if it can be
-        modified, we return num_gpu_blocks=num_cpu_blocks and num_cpu_blocks=0.
-        This allows us to reuse the scheduler of vLLM without generalizing it
-        to different devices.
         """
         # For OpenVINO backend, in case of CPU device, the block number will be
         # calculated based on the openvino_kvcache_space_bytes.
@@ -293,13 +288,8 @@ class OpenVINOWorker(LoraNotSupportedWorkerBase):
 
         ov_device = envs.VLLM_OPENVINO_DEVICE
         if "CPU" in ov_device:
-            num_cpu_blocks = int(kvcache_space_bytes // cache_block_size)
-            num_cpu_blocks = max(num_cpu_blocks, 0)
-
-            # Note: To reuse the cache management procedure,
-            # use cpu cache as 'gpu cache'.
-            num_gpu_blocks = num_cpu_blocks
-            num_cpu_blocks = 0
+            num_device_blocks = int(kvcache_space_bytes // cache_block_size)
+            num_swap_blocks = 0
         else:
             if kvcache_space_bytes > 0:
                 logger.info("KV_CACHE size was explicitly configured via "
@@ -309,40 +299,31 @@ class OpenVINOWorker(LoraNotSupportedWorkerBase):
             else:
                 kv_cache_size = self.profile_run()
 
-            num_gpu_blocks = int(kv_cache_size // cache_block_size)
-            num_cpu_blocks = int(self.cache_config.swap_space_bytes //
-                                 cache_block_size)
+            num_device_blocks = int(kv_cache_size // cache_block_size)
+            num_swap_blocks = int(self.cache_config.swap_space_bytes //
+                                  cache_block_size)
 
-            num_gpu_blocks = max(num_gpu_blocks, 0)
-            num_cpu_blocks = max(num_cpu_blocks, 0)
-
-        return num_gpu_blocks, num_cpu_blocks
+        return num_device_blocks, num_swap_blocks
 
     def initialize_cache(self, num_gpu_blocks: int,
                          num_cpu_blocks: int) -> None:
-        """Initialize the KV cache. Currently, swappable CPU memory is not
-        supported.
+        """Initialize the KV cache. Swappable CPU memory is only
+        supported on GPU.
 
-        Since this worker does not support GPUs, we use the num_gpu_blocks to
+        For CPU, we use the num_gpu_blocks to
         determine how many non-swappable CPU blocks to allocate.
         """
 
-        ov_device = envs.VLLM_OPENVINO_DEVICE
-        if "CPU" in ov_device:
-            assert (num_cpu_blocks == 0
-                    ), f"{type(self)} does not support swappable cache"
+        num_device_blocks = num_gpu_blocks
+        num_swap_blocks = num_cpu_blocks
 
-            # Note: To reuse the cache management procedure,
-            # use cpu cache as 'gpu cache'.
-            num_cpu_blocks = num_gpu_blocks
+        if "CPU" in envs.VLLM_OPENVINO_DEVICE:
+            assert (num_swap_blocks == 0
+                    ), f"{type(self)} does not support swappable cache for CPU"
 
-            self._validate_num_blocks(num_cpu_blocks)
-            self.cache_config.num_gpu_blocks = num_cpu_blocks
-            self.cache_config.num_cpu_blocks = 0
-        else:
-            self._validate_num_blocks(num_gpu_blocks)
-            self.cache_config.num_gpu_blocks = num_gpu_blocks
-            self.cache_config.num_cpu_blocks = num_cpu_blocks
+        self._validate_num_blocks(num_device_blocks)
+        self.cache_config.num_gpu_blocks = num_device_blocks
+        self.cache_config.num_cpu_blocks = num_swap_blocks
 
         # Initialize the cache.
         self._init_cache_engine()
