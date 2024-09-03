@@ -297,7 +297,14 @@ class OpenVINOWorker(LoraNotSupportedWorkerBase):
                             "variable, ignoring profiling run.")
                 kv_cache_size = kvcache_space_bytes
             else:
-                kv_cache_size = self.profile_run()
+                try:
+                    kv_cache_size = self.profile_run()
+                except Exception as err:
+                    raise RuntimeError(
+                        "The error occurred during profile run. This might be "
+                        "due to insufficient GPU memory. Consider decreasing "
+                        "`max_model_len` to limit the maximum simultaneously "
+                        "processed tokens.") from err
 
             num_device_blocks = int(kv_cache_size // cache_block_size)
             num_swap_blocks = int(self.cache_config.swap_space_bytes //
