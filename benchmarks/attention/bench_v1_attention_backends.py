@@ -30,19 +30,31 @@ from typing import Optional, Union
 import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
-from vllm.attention.backends.registry import (
-    _Backend,
-    backend_name_to_enum,
-    backend_to_class,
-)
+try:
+    from vllm.attention.backends.registry import (
+        _Backend,
+        backend_name_to_enum,
+    )
+except:
+    from vllm.platforms import _Backend
+    from vllm.attention.selector import backend_name_to_enum
+
 from vllm.config import ModelConfig
 from vllm.platforms import current_platform
-from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, cdiv, is_torch_equal_or_newer
+
+try:
+    from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, cdiv, is_torch_equal_or_newer
+except:
+    from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, is_torch_equal_or_newer
+    from vllm.utils import cdiv
+
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
     set_kv_cache_layout,
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+# if import failed, just copy utils.py near to the current script
 from tests.v1.attention.utils import (
     BatchSpec,
     create_common_attn_metadata,
