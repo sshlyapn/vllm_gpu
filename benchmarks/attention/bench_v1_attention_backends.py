@@ -54,14 +54,33 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-# if import failed, just copy utils.py near to the current script
-from tests.v1.attention.utils import (
-    BatchSpec,
-    create_common_attn_metadata,
-    create_standard_kv_cache_spec,
-    create_vllm_config,
-    try_get_attention_backend,
-)
+try:
+    from tests.v1.attention.utils import (
+        BatchSpec,
+        create_common_attn_metadata,
+        create_standard_kv_cache_spec,
+        create_vllm_config,
+        try_get_attention_backend,
+    )
+except:    
+    try:
+        from utils import (
+            BatchSpec,
+            create_common_attn_metadata,
+            create_standard_kv_cache_spec,
+            create_vllm_config,
+            try_get_attention_backend,
+        )
+    except:
+        raise ImportError(
+        "Some utility functions are currently unavailable due to recent VLLM refactoring.\n"
+        "To resolve this:\n"
+        "  1. Please copy 'utils.py' from 'tests/v1/attention/utils.py' to the directory containing your current script.\n"
+        "  2. You may also need to patch the import of 'resolve_obj_by_qualname'.\n"
+        "     Change the import statement from:\n"
+        "         'from vllm.utils import resolve_obj_by_qualname'\n"
+        "     to:\n"
+        "         'from vllm.utils.import_utils import resolve_obj_by_qualname'\n")
 
 
 def _convert_dtype_to_torch(dtype):
@@ -158,11 +177,11 @@ BATCH_SPECS = {
     "custom_single_decode_medium": BatchSpec(seq_lens=[2048], query_lens=[1]),
     "custom_single_decode_large": BatchSpec(seq_lens=[8192], query_lens=[1]),
 
-    "custom_medium_decode": BatchSpec(
+    "custom_multi_decode_medium": BatchSpec(
         seq_lens=[128, 256, 512, 1024, 128, 256, 512, 1024],
         query_lens=[1, 1, 1, 1, 1, 1, 1, 1],
     ),
-    "custom_medium_prefill": BatchSpec(
+    "custom_multi_prefill_medium": BatchSpec(
         seq_lens=[256, 512, 1024, 2048], query_lens=[256, 512, 1024, 2048]
     ),
 
@@ -687,6 +706,8 @@ def main():
 
     batch_spec = BATCH_SPECS[args.batch_spec]
     vllm_config = build_vllm_config(args.model, max(batch_spec.seq_lens) + max(batch_spec.query_lens), len(batch_spec.seq_lens), args.block_size, dtype)
+    # update dtype to the actual dtype specified by the model
+    dtype = vllm_config.model_config.dtype
     kv_cache_spec = build_kv_cache_spec(vllm_config)
 
     num_q_heads = vllm_config.model_config.get_num_attention_heads(vllm_config.parallel_config)
