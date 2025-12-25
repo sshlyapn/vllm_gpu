@@ -575,6 +575,12 @@ def main(args: argparse.Namespace):
     if args.model_prefix:
         config = getattr(config, args.model_prefix)
 
+    # Keep global values for reporting.
+    global_hidden_size = None
+    global_intermediate_size = None
+    global_E = None
+    global_topk = None
+
     if config.architectures[0] == "DbrxForCausalLM":
         E = config.ffn_config.moe_num_experts
         topk = config.ffn_config.moe_top_k
@@ -629,11 +635,49 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
         hidden_size = config.hidden_size
+    global_E = E
+    global_topk = topk
+    global_hidden_size = hidden_size
+    global_intermediate_size = intermediate_size
+    # Determine local expert count (E_local) and MLP shard size based on EP/TP.
+    # If --enable-expert-parallel is set, derive EP degree from --num-gpus.
+    # Otherwise, fall back to TP-only behavior (shard MLP by TP).
     enable_ep = bool(args.enable_expert_parallel)
+    num_gpus_arg = getattr(args, "num_gpus", None)
+    num_gpus_avail = None
+
+    def _auto_ep_degree(global_experts: int, max_degree: int) -> int:
+        # Choose the largest divisor of global_experts that is <= max_degree and >= 2.
+        upper = min(global_experts, max_degree)
+        for d in range(upper, 1, -1):
+            if global_experts % d == 0:
+                return d
+        return 1
+
+    ep_size_used = 1
     if enable_ep:
-        ensure_divisibility(E, args.tp_size, "Number of experts")
-        E = E // args.tp_size
-        shard_intermediate_size = 2 * intermediate_size
+        if num_gpus_arg is None:
+            raise ValueError(
+                "--num-gpus is required when --enable-expert-parallel is set."
+            )
+        num_gpus_avail = int(num_gpus_arg)
+        ep_size_auto = _auto_ep_degree(E, num_gpus_avail)
+        if ep_size_auto > 1:
+            E = E // ep_size_auto
+            shard_intermediate_size = 2 * intermediate_size
+            ep_size_used = ep_size_auto
+            print(
+                f"Auto EP enabled from GPU count: num_gpus={num_gpus_avail}, "
+                f"ep_size={ep_size_auto}, local_experts={E}."
+            )
+        else:
+            # Fall back to TP-divide behavior if no valid EP degree >1 is found.
+            ensure_divisibility(intermediate_size, args.tp_size, "intermediate_size")
+            shard_intermediate_size = 2 * intermediate_size // args.tp_size
+            print(
+                "Auto EP could not find a valid degree (>1). "
+                "Falling back to TP-only sharding of MLP."
+            )
     else:
         ensure_divisibility(intermediate_size, args.tp_size, "intermediate_size")
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
@@ -641,6 +685,44 @@ def main(args: argparse.Namespace):
     use_fp8_w8a8 = args.dtype == "fp8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
     block_quant_shape = get_weight_block_size_safety(config)
+
+    # Compute local top-k used by routing on this GPU: clamp to local experts.
+    topk_local = min(topk, E)
+
+    # Helper: print real-scenario vs benchmark shapes per batch size.
+    def _print_config_comparison(batch_size_value: int):
+        M_bench = batch_size_value
+        H = global_hidden_size
+        S_local = shard_intermediate_size
+        E_local = E
+        M_prime_bench = M_bench * topk_local
+        # Equivalent real global tokens that would yield the same per-GPU rows:
+        # real_rows_per_gpu = M_global * global_topk / ep_size_used
+        # Set real_rows_per_gpu == M_prime_bench → M_global_equiv:
+        M_global_equiv = (
+            (M_prime_bench * ep_size_used) / global_topk if ep_size_used > 0 else M_bench
+        )
+        # Real per-GPU MLP S is unsharded under EP, TP-sharded otherwise.
+        S_real = 2 * global_intermediate_size if ep_size_used > 1 else S_local
+        print(
+            f"[Config] batch_size={M_bench} | E_global={global_E}, k_global={global_topk}, "
+            f"EP_degree={ep_size_used}, TP_size={args.tp_size}"
+        )
+        print(
+            f"  benchmarking: E_local={E_local}, k_local={topk_local}, H={H}, S_local={S_local}, "
+            f"M_prime={M_prime_bench} | W1=({E_local}, {S_local}, {H}), "
+            f"W2=({E_local}, {H}, {S_local // 2}); "
+            f"GEMM1=({M_prime_bench}, {H}) x ({H}, {S_local}); "
+            f"GEMM2=({M_prime_bench}, {S_local // 2}) x ({S_local // 2}, {H})"
+        )
+        print(
+            f"  real-scenario: M_global≈{int(M_global_equiv)} (equiv), per-GPU rows={M_prime_bench}, "
+            f"H={H}, S_real={S_real}, E_local={E_local} | "
+            f"W1=({E_local}, {S_real}, {H}), W2=({E_local}, {H}, {S_real // 2}); "
+            f"GEMM1=({M_prime_bench}, {H}) x ({H}, {S_real}); "
+            f"GEMM2=({M_prime_bench}, {S_real // 2}) x ({S_real // 2}, {H})"
+        )
+        print("  Note: No cross-GPU communication is performed in this benchmark.\n")
 
     if args.batch_size is None:
         batch_sizes = [
@@ -665,6 +747,10 @@ def main(args: argparse.Namespace):
         ]
     else:
         batch_sizes = args.batch_size
+
+    # Print comparison for each requested batch size.
+    for _bs in batch_sizes:
+        _print_config_comparison(_bs)
 
     use_deep_gemm = bool(args.use_deep_gemm)
 
@@ -711,7 +797,7 @@ def main(args: argparse.Namespace):
                     E,
                     shard_intermediate_size,
                     hidden_size,
-                    topk,
+                    topk_local,
                     dtype,
                     use_fp8_w8a8,
                     use_int8_w8a16,
@@ -730,7 +816,7 @@ def main(args: argparse.Namespace):
             E,
             shard_intermediate_size,
             hidden_size,
-            topk,
+            topk_local,
             dtype,
             use_fp8_w8a8,
             use_int8_w8a16,
@@ -748,7 +834,7 @@ def main(args: argparse.Namespace):
                     E,
                     shard_intermediate_size,
                     hidden_size,
-                    topk,
+                    topk_local,
                     dtype,
                     use_fp8_w8a8,
                     use_int8_w8a16,
@@ -785,6 +871,15 @@ if __name__ == "__main__":
     parser.add_argument("--tune", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--model-prefix", type=str, required=False)
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=None,
+        help=(
+            "Number of GPUs to consider for auto EP derivation. Required when "
+            "--enable-expert-parallel is set."
+        ),
+    )
     args = parser.parse_args()
 
     main(args)
