@@ -571,9 +571,10 @@ def get_weight_block_size_safety(config, default_value=None):
 def main(args: argparse.Namespace):
     print(args)
 
-    config = get_config(model=args.model, trust_remote_code=args.trust_remote_code)
+    root_config = get_config(model=args.model, trust_remote_code=args.trust_remote_code)
+    config = root_config
     if args.model_prefix:
-        config = getattr(config, args.model_prefix)
+        config = getattr(root_config, args.model_prefix)
 
     # Keep global values for reporting.
     global_hidden_size = None
@@ -635,6 +636,15 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
         hidden_size = config.hidden_size
+    # Apply manual overrides if provided
+    if getattr(args, "override_num_experts", None) is not None:
+        E = int(args.override_num_experts)
+    if getattr(args, "override_topk", None) is not None:
+        topk = int(args.override_topk)
+    if getattr(args, "override_hidden_size", None) is not None:
+        hidden_size = int(args.override_hidden_size)
+    if getattr(args, "override_intermediate_size", None) is not None:
+        intermediate_size = int(args.override_intermediate_size)
     global_E = E
     global_topk = topk
     global_hidden_size = hidden_size
@@ -681,13 +691,55 @@ def main(args: argparse.Namespace):
     else:
         ensure_divisibility(intermediate_size, args.tp_size, "intermediate_size")
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
-    dtype = torch.float16 if current_platform.is_rocm() else config.dtype
-    use_fp8_w8a8 = args.dtype == "fp8_w8a8"
-    use_int8_w8a16 = args.dtype == "int8_w8a16"
+    requested_dtype = str(args.dtype).lower()
+    use_fp8_w8a8 = requested_dtype == "fp8_w8a8"
+    use_int8_w8a16 = requested_dtype == "int8_w8a16"
+
+    # Base (auto) dtype selection.
+    dtype: torch.dtype = torch.float16 if current_platform.is_rocm() else config.dtype
+
+    # Honor explicit dtype overrides for unquantized runs.
+    if not (use_fp8_w8a8 or use_int8_w8a16):
+        if requested_dtype in ("f16", "fp16", "float16"):
+            dtype = torch.float16
+        elif requested_dtype in ("f32", "fp32", "float32"):
+            dtype = torch.float32
+        elif requested_dtype != "auto":
+            raise ValueError(f"Unsupported --dtype value: {args.dtype}")
     block_quant_shape = get_weight_block_size_safety(config)
 
     # Compute local top-k used by routing on this GPU: clamp to local experts.
     topk_local = min(topk, E)
+
+    def _get_first_arch(cfg: Any) -> str:
+        archs = getattr(cfg, "architectures", None)
+        if isinstance(archs, (list, tuple)) and len(archs) > 0:
+            return str(archs[0])
+        return "<unknown>"
+
+    # Print a one-time model/config summary (global + derived local values).
+    root_arch = _get_first_arch(root_config)
+    effective_arch = _get_first_arch(config)
+    effective_arch_str = (
+        effective_arch if effective_arch != "<unknown>" else root_arch
+    )
+    print("[Model config]")
+    print(
+        f"  model={args.model} | arch={effective_arch_str}"
+        + (f" | model_prefix={args.model_prefix}" if args.model_prefix else "")
+    )
+    print(
+        f"  global: E={global_E}, topk={global_topk}, hidden_size={global_hidden_size}, "
+        f"intermediate_size={global_intermediate_size}"
+    )
+    print(
+        f"  parallelism: enable_ep={enable_ep}, EP_degree={ep_size_used}, TP_size={args.tp_size} | "
+        f"local: E_local={E}, topk_local={topk_local}, shard_intermediate_size={shard_intermediate_size}"
+    )
+    print(
+        f"  dtype: requested={args.dtype}, model={getattr(config, 'dtype', None)}, benchmark={dtype}, "
+        f"weight_block_size={block_quant_shape}\n"
+    )
 
     # Helper: print real-scenario vs benchmark shapes per batch size.
     def _print_config_comparison(batch_size_value: int):
@@ -860,7 +912,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--enable-expert-parallel", "-enable-ep", action="store_true")
     parser.add_argument(
-        "--dtype", type=str, choices=["auto", "fp8_w8a8", "int8_w8a16"], default="auto"
+        "--dtype",
+        type=str,
+        choices=["auto", "fp16", "fp32", "f16", "f32", "fp8_w8a8", "int8_w8a16"],
+        default="auto",
     )
     parser.add_argument("--use-deep-gemm", action="store_true")
     parser.add_argument(
@@ -871,6 +926,30 @@ if __name__ == "__main__":
     parser.add_argument("--tune", action="store_true")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--model-prefix", type=str, required=False)
+    parser.add_argument(
+        "--override-num-experts",
+        type=int,
+        default=None,
+        help="Override global number of experts (E_global).",
+    )
+    parser.add_argument(
+        "--override-topk",
+        type=int,
+        default=None,
+        help="Override global routing top-k (k_global).",
+    )
+    parser.add_argument(
+        "--override-hidden-size",
+        type=int,
+        default=None,
+        help="Override hidden size H.",
+    )
+    parser.add_argument(
+        "--override-intermediate-size",
+        type=int,
+        default=None,
+        help="Override intermediate size (model MLP size before x2 in SiLU*Gate).",
+    )
     parser.add_argument(
         "--num-gpus",
         type=int,
