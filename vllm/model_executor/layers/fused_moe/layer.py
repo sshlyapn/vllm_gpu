@@ -354,6 +354,7 @@ def FusedMoE(
         swiglu_beta=swiglu_beta,
         max_capture_size=vllm_config.compilation_config.max_cudagraph_capture_size,
         skip_final_all_reduce=skip_final_all_reduce,
+        num_fused_shared_experts=num_fused_shared_experts,
     )
 
     logger.debug("FusedMoEConfig = %s", moe_config)
