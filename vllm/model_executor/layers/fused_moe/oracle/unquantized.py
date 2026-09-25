@@ -393,6 +393,27 @@ def unquantized_round_up_hidden_size_and_intermediate_size(
     return hidden_size, intermediate_size
 
 
+def _zero_intermediate_padding(
+    moe_config: FusedMoEConfig,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+) -> None:
+    """Zero the intermediate-dim padding lanes of padded MoE weights.
+
+    Reloads rewrite only checkpoint slices, leaving pad lanes dirty; the kernel
+    computes over the full padded size, so they must be zero.
+    """
+    unpadded = moe_config.intermediate_size_per_partition_unpadded
+    assert unpadded is not None
+    padded = w2_weight.shape[-1]
+    if padded <= unpadded:
+        return
+    w13_weight[:, unpadded:padded].zero_()
+    if moe_config.is_act_and_mul:
+        w13_weight[:, padded + unpadded :].zero_()
+    w2_weight[:, :, unpadded:].zero_()
+
+
 def convert_to_unquantized_kernel_format(
     unquantized_backend: UnquantizedMoeBackend,
     moe_config: FusedMoEConfig,
@@ -435,6 +456,8 @@ def convert_to_unquantized_kernel_format(
         return layout.full_gate_weight, layout.full_down_weight
 
     if unquantized_backend == UnquantizedMoeBackend.AITER:
+        # Zero pads before the shuffle scatters them into the tiled layout.
+        _zero_intermediate_padding(moe_config, w13_weight, w2_weight)
         w13_weight, w2_weight = rocm_aiter_ops.shuffle_weights(w13_weight, w2_weight)
         w13_weight.is_shuffled = True
         w2_weight.is_shuffled = True
@@ -456,15 +479,7 @@ def convert_to_unquantized_kernel_format(
         )
         moe_config.intermediate_size_per_partition = padded_intermediate
 
-        # Reloads only overwrite checkpoint slices. An earlier in-place
-        # permutation can leave nonzero values in the raw padding slots.
-        unpadded = moe_config.intermediate_size_per_partition_unpadded
-        assert unpadded is not None
-        if padded_intermediate > unpadded:
-            w13_weight[:, unpadded:padded_intermediate].zero_()
-            if is_act_and_mul:
-                w13_weight[:, padded_intermediate + unpadded :].zero_()
-            w2_weight[:, :, unpadded:].zero_()
+        _zero_intermediate_padding(moe_config, w13_weight, w2_weight)
 
         _cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
         convert_moe_weights_to_flashinfer_trtllm_block_layout(
