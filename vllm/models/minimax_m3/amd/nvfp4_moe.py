@@ -70,8 +70,10 @@ def nvfp4_moe_baseline_fmt() -> str:
 
 
 def nvfp4_moe_prefill() -> str:
-    v = _env_choice("VLLM_M3_NVFP4_MOE_PREFILL", "mxfp8", _BASELINE_ALIASES + ("nv",))
-    return "nv" if v == "nv" else "baseline"
+    v = _env_choice(
+        "VLLM_M3_NVFP4_MOE_PREFILL", "mxfp8", _BASELINE_ALIASES + ("nv", "hip")
+    )
+    return v if v in ("nv", "hip") else "baseline"
 
 
 def nvfp4_moe_nv_large() -> str:
@@ -243,6 +245,11 @@ class MiniMaxM3NvFp4MoEMethod(ModelOptMxFp8FusedMoE):
     # ------------------------------------------------------------ planning
     def _plan(self):
         """(nv modes to build, whether the baseline copy is needed)."""
+        if self.prefill == "hip":
+            # HIP kernel for every T (chunked above hip_max_t): one weight copy.
+            if not self.use_hip:
+                raise ValueError("VLLM_M3_NVFP4_MOE_PREFILL=hip needs VLLM_M3_NVFP4_MOE_HIP=1")
+            return [], self.keep_baseline
         big = self.max_tokens is None or self.max_tokens > self.nv2_max_t
         modes = []
         need_base = self.prefill != "nv"
@@ -446,6 +453,23 @@ class MiniMaxM3NvFp4MoEMethod(ModelOptMxFp8FusedMoE):
             )
 
             return nvfp4_moe_decode(self.hip_weights, x, topk_ids, topk_weights)
+        if self.hip_weights is not None and self.prefill == "hip":
+            from vllm.models.minimax_m3.amd.ops.nvfp4_moe_dec import (
+                nvfp4_moe_decode,
+            )
+
+            m = self.hip_max_t
+            return torch.cat(
+                [
+                    nvfp4_moe_decode(
+                        self.hip_weights,
+                        x[i : i + m],
+                        topk_ids[i : i + m],
+                        topk_weights[i : i + m],
+                    )
+                    for i in range(0, T, m)
+                ]
+            )
         nv = self.nv_weights
         if nv is not None:
             mode = None
