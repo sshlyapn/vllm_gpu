@@ -28,19 +28,19 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
-# Debug: histogram of (prefill rows, dqC groups) per metadata build, logged
-# every _DQC_LOG_EVERY prefill builds.
+# Debug: histogram of (prefill rows, dqC groups, fused rows) per metadata
+# build, logged every _DQC_LOG_EVERY prefill builds.
 _DQC_LOG_GROUPS = os.environ.get("MINIMAX_M3_DQC_LOG_GROUPS", "0") == "1"
 _DQC_LOG_EVERY = 10
-_dqc_group_hist: Counter[tuple[int, int]] = Counter()
+_dqc_group_hist: Counter[tuple[int, int, int]] = Counter()
 
 
-def _log_dqc_groups(rows: int, groups: int) -> None:
-    _dqc_group_hist[(rows, groups)] += 1
+def _log_dqc_groups(rows: int, groups: int, fused_rows: int) -> None:
+    _dqc_group_hist[(rows, groups, fused_rows)] += 1
     total = sum(_dqc_group_hist.values())
     if total % _DQC_LOG_EVERY == 0:
         hist = " ".join(
-            f"{r}r{g}g:{c}" for (r, g), c in sorted(_dqc_group_hist.items())
+            f"{r}r{g}g{f}f:{c}" for (r, g, f), c in sorted(_dqc_group_hist.items())
         )
         logger.info("MiniMax-M3 dqC groups after %d prefill builds: %s", total, hist)
 
@@ -63,6 +63,9 @@ class MiniMaxM3SparseAiterPAPrefillMetadata(MiniMaxM3SparsePrefillMetadata):
     # dqC workspace block table; see minimax_m3_dqc_ws_block_table. When set,
     # it is also ``page16_block_table``, so the top-k emits workspace ids.
     dqc_ws_block_table: torch.Tensor | None = None
+    # Rows below MINIMAX_M3_DQC_MIN_QLEN new tokens, run fused; see
+    # minimax_m3_dqc_hybrid_plan.
+    dqc_fused_runs: list[tuple[int, int, int, int]] | None = None
 
 
 @dataclass
@@ -115,7 +118,9 @@ class MiniMaxM3SparseAiterPAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
     ) -> MiniMaxM3SparseMetadata:
         from vllm.models.minimax_m3.amd.ops.sparse_pa import (
             minimax_m3_dqc_enabled,
-            minimax_m3_dqc_groups,
+            minimax_m3_dqc_hybrid_plan,
+            minimax_m3_dqc_min_qlen,
+            minimax_m3_dqc_mix_block_table,
             minimax_m3_dqc_ws_block_table,
             minimax_m3_rebase_block_table_to_page16,
         )
@@ -145,7 +150,7 @@ class MiniMaxM3SparseAiterPAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
                 page16_block_table=page16[:nd],
             )
         if metadata.prefill is not None:
-            dqc_groups = dqc_ws_bt = None
+            dqc_groups = dqc_ws_bt = fused_runs = None
             prefill_page16 = page16[nd:]
             if minimax_m3_dqc_enabled():
                 n = common_attn_metadata.num_reqs
@@ -153,26 +158,38 @@ class MiniMaxM3SparseAiterPAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
                 assert seq_ub is not None
                 qsl = common_attn_metadata.query_start_loc_cpu[nd : n + 1]
                 prefill_seq_ub = seq_ub[nd:n].tolist()
-                dqc_groups = minimax_m3_dqc_groups(
+                dqc_groups, fused_runs = minimax_m3_dqc_hybrid_plan(
                     prefill_seq_ub,
                     (qsl - qsl[0]).tolist(),
                     self.dqc_budget_blocks,
+                    minimax_m3_dqc_min_qlen(),
                 )
                 # Once per step from the CPU upper bound the groups were
                 # budgeted on (no sync). Handed to the top-k as the prefill
                 # page-16 table, so every layer's sparse table already holds
-                # workspace ids.
-                dqc_ws_bt = minimax_m3_dqc_ws_block_table(
-                    prefill_seq_ub, dqc_groups, block_table.device
-                )
-                prefill_page16 = dqc_ws_bt
+                # workspace ids for the dqC rows (physical ids for the
+                # fused ones).
+                if dqc_groups:
+                    dqc_ws_bt = minimax_m3_dqc_ws_block_table(
+                        prefill_seq_ub, dqc_groups, block_table.device
+                    )
+                    if fused_runs:
+                        dqc_ws_bt = minimax_m3_dqc_mix_block_table(
+                            dqc_ws_bt, prefill_page16, dqc_groups
+                        )
+                    prefill_page16 = dqc_ws_bt
                 if _DQC_LOG_GROUPS:
-                    _log_dqc_groups(n - nd, len(dqc_groups))
+                    _log_dqc_groups(
+                        n - nd,
+                        len(dqc_groups),
+                        sum(r1 - r0 for r0, r1, *_ in fused_runs),
+                    )
             metadata.prefill = MiniMaxM3SparseAiterPAPrefillMetadata(
                 **vars(metadata.prefill),
                 page16_block_table=prefill_page16,
                 dqc_groups=dqc_groups,
                 dqc_ws_block_table=dqc_ws_bt,
+                dqc_fused_runs=fused_runs,
             )
         return metadata
 
@@ -346,5 +363,6 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
                 dqc_groups=p.dqc_groups,
                 dqc_ws_pages=self.dqc_ws_pages or None,
                 dqc_ws_block_table=p.dqc_ws_block_table,
+                dqc_fused_runs=p.dqc_fused_runs,
             )
         return output

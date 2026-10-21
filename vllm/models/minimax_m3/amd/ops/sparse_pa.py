@@ -775,6 +775,71 @@ def minimax_m3_dqc_groups(
     return groups
 
 
+@cache
+def minimax_m3_dqc_min_qlen() -> int:
+    """MINIMAX_M3_DQC_MIN_QLEN (default 0, dqC only): prefill rows with fewer
+    new tokens run the fused NVFP4 kernel instead of dqC, whose whole-context
+    dequant does not pay off for short chunks. 0 sends every row to dqC.
+    """
+    n = int(os.environ.get("MINIMAX_M3_DQC_MIN_QLEN", "0"))
+    if n < 0:
+        raise ValueError(f"MINIMAX_M3_DQC_MIN_QLEN must be >= 0, got {n}")
+    return n
+
+
+def minimax_m3_dqc_hybrid_plan(
+    seq_lens_cpu: list[int],
+    query_start_cpu: list[int],
+    budget_blocks: int,
+    min_qlen: int,
+) -> tuple[list[tuple[int, int, int, int, int]], list[tuple[int, int, int, int]]]:
+    """Split prefill rows by query length: >= min_qlen to dqC, others fused.
+
+    Returns (dqC groups as minimax_m3_dqc_groups, over the dqC rows only;
+    fused runs as (row_start, row_end, q_start, q_end)). Both index the whole
+    prefill batch; runs of consecutive rows of one mode stay together.
+    """
+    groups: list[tuple[int, int, int, int, int]] = []
+    fused: list[tuple[int, int, int, int]] = []
+    qs = query_start_cpu
+    n = len(seq_lens_cpu)
+    r = 0
+    while r < n:
+        dq = qs[r + 1] - qs[r] >= min_qlen
+        e = r + 1
+        while e < n and (qs[e + 1] - qs[e] >= min_qlen) == dq:
+            e += 1
+        if dq:
+            for a, b, q0, q1, blk in minimax_m3_dqc_groups(
+                seq_lens_cpu[r:e], qs[r : e + 1], budget_blocks
+            ):
+                groups.append((a + r, b + r, q0, q1, blk))
+        else:
+            fused.append((r, e, qs[r], qs[e]))
+        r = e
+    return groups, fused
+
+
+def minimax_m3_dqc_mix_block_table(
+    ws_block_table: torch.Tensor,
+    page16_block_table: torch.Tensor,
+    groups: list[tuple[int, int, int, int, int]],
+) -> torch.Tensor:
+    """Rows of ``groups`` from the workspace table, the rest from the page-16
+    table (physical ids), so one top-k emits both kinds of rows."""
+    rows, c16 = page16_block_table.shape
+    cws = ws_block_table.shape[1]
+    out = torch.empty(
+        (rows, max(c16, cws)), dtype=torch.int32, device=page16_block_table.device
+    )
+    out[:, :c16] = page16_block_table
+    if cws > c16:
+        out[:, c16:] = 0
+    for r0, r1, *_ in groups:
+        out[r0:r1, :cws] = ws_block_table[r0:r1]
+    return out
+
+
 def minimax_m3_dqc_ws_block_table(
     seq_lens_cpu: list[int],
     groups: list[tuple[int, int, int, int, int]],
@@ -1061,6 +1126,7 @@ def minimax_m3_sparse_attn_prefill_aiter(
     dqc_groups: list[tuple[int, int, int, int, int]] | None = None,
     dqc_ws_pages: int | None = None,
     dqc_ws_block_table: torch.Tensor | None = None,
+    dqc_fused_runs: list[tuple[int, int, int, int]] | None = None,
 ) -> None:
     """dqc_groups (from minimax_m3_dqc_groups): prefill rows are dequantized
     and attended group by group in one fixed workspace of dqc_ws_pages pages.
@@ -1070,6 +1136,11 @@ def minimax_m3_sparse_attn_prefill_aiter(
     given sparse_bt was emitted through it and holds workspace page ids, and
     one built here is built through it; no per-layer remap. None: sparse_bt
     holds physical page ids and dqC remaps them per group.
+
+    dqc_fused_runs (from minimax_m3_dqc_hybrid_plan): these rows run the
+    fused NVFP4 kernel and dqc_groups cover only the rest. Their rows of
+    dqc_ws_block_table hold physical page-16 ids
+    (minimax_m3_dqc_mix_block_table).
     """
     if (sparse_bt is None) != (sparse_ctx is None):
         raise ValueError(
@@ -1109,13 +1180,30 @@ def minimax_m3_sparse_attn_prefill_aiter(
         total_q = q.shape[0]
         if dqc_groups is None:
             dqc_groups = [(0, seq_lens.shape[0], 0, total_q, total_kv_blocks)]
+        kvh = num_kv_heads
+        for _, _, q0, q1 in dqc_fused_runs or ():
+            if q1 > q0:
+                _run_gluon_decode(
+                    q[q0:q1],
+                    k_cache,
+                    v_cache,
+                    sparse_bt[q0 * kvh : q1 * kvh],
+                    sparse_ctx[q0 * kvh : q1 * kvh],
+                    num_kv_heads,
+                    sm_scale,
+                    output[q0:q1],
+                    k_scale,
+                    v_scale,
+                    split_num_seqs=total_q * kvh,
+                )
+        if not dqc_groups:
+            return
         if dqc_ws_pages is None:
             dqc_ws_pages = max(g[4] for g in dqc_groups) * PAGES_PER_SPARSE_BLOCK
         # Requested at the same size every call: the profiled reservation
         # never grows.
         workspace = minimax_m3_dqc_workspace(dqc_ws_pages)
         one = _one(q.device)
-        kvh = num_kv_heads
         for r0, r1, q0, q1, blocks in dqc_groups:
             if q1 == q0:
                 continue
