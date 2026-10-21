@@ -45,6 +45,17 @@ def _is_fp8_e4m3_tensor(t: torch.Tensor | None) -> bool:
     return t is not None and t.dtype in _FP8_E4M3_DTYPES
 
 
+@functools.cache
+def _aiter_fused_qknorm_supports_nvfp4() -> bool:
+    try:
+        from aiter.ops.fused_qknorm_idxrqknorm import (
+            FUSED_QKNORM_IDXRQKNORM_SUPPORTS_NVFP4,
+        )
+    except ImportError:
+        return False
+    return bool(FUSED_QKNORM_IDXRQKNORM_SUPPORTS_NVFP4)
+
+
 def _get_or_create_aiter_qr_rmsnorm_comm(
     device_comm: Any,
 ) -> tuple[int, int, bool] | None:
@@ -2289,15 +2300,22 @@ class rocm_aiter_ops:
         kv_cache_dtype: str,
         k_scale: torch.Tensor | None = None,
         v_scale: torch.Tensor | None = None,
+        kv_nvfp4: bool = False,
+        index_nvfp4: bool = False,
     ) -> bool:
         """Whether MiniMax-M3 can use AITER's consolidated fused QK-norm.
 
         Requires AITER to be installed and enabled. bf16 (``auto``) always
-        qualifies; fp8 e4m3 also needs K/V scales. Other cache dtypes fall
-        back to vLLM's fused kernel.
+        qualifies; fp8 e4m3 also needs K/V scales. NVFP4 K/V (inside the fp8
+        pages) or NVFP4 index keys need an AITER build with NVFP4 output.
+        Other cache dtypes fall back to vLLM's fused kernel.
         """
         if not cls._AITER_ENABLED:
             return False
+        if (kv_nvfp4 or index_nvfp4) and not _aiter_fused_qknorm_supports_nvfp4():
+            return False
+        if kv_nvfp4:
+            return (k_scale is None) == (v_scale is None)
         if kv_cache_dtype == "auto":
             return True
         if kv_cache_dtype in ("fp8", "fp8_e4m3"):
@@ -2330,13 +2348,22 @@ class rocm_aiter_ops:
         index_q_out: torch.Tensor | None = None,
         index_slot_mapping: torch.Tensor | None = None,
         skip_index_branch: bool = False,
+        kv_nvfp4: bool = False,
+        index_nvfp4: bool = False,
     ) -> None:
         """Run consolidated MiniMax-M3 QK-norm fusion.
 
         Callers must check ``fused_qknorm_idxrqknorm_enabled`` first. Runtime
-        failures from the AITER op are deliberately propagated.
+        failures from the AITER op are deliberately propagated. ``kv_nvfp4``
+        writes K/V as NVFP4 into the page-16 fp8 pages (2048 B head chunks or
+        compact pages) and ``index_nvfp4`` writes the index key in the AITER
+        MSA NVFP4 layout.
         """
-        if kv_cache_dtype == "auto":
+        if kv_nvfp4:
+            aiter_kv_cache_dtype = "nvfp4"
+            aiter_k_scale = k_scale
+            aiter_v_scale = v_scale
+        elif kv_cache_dtype == "auto":
             aiter_kv_cache_dtype = "auto"
             aiter_k_scale = None
             aiter_v_scale = None
@@ -2349,7 +2376,12 @@ class rocm_aiter_ops:
                 "AITER fused QK-norm requires kv_cache_dtype 'auto', 'fp8', "
                 f"or 'fp8_e4m3', got {kv_cache_dtype!r}"
             )
-        aiter_index_cache_dtype = "fp8" if _is_fp8_e4m3_tensor(index_cache) else "auto"
+        if index_nvfp4:
+            aiter_index_cache_dtype = "nvfp4"
+        elif _is_fp8_e4m3_tensor(index_cache):
+            aiter_index_cache_dtype = "fp8"
+        else:
+            aiter_index_cache_dtype = "auto"
 
         from aiter import fused_qknorm_idxrqknorm
 

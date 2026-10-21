@@ -1102,14 +1102,15 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             )
             k_scale = getattr(self, "_k_scale", None)
             v_scale = getattr(self, "_v_scale", None)
-            # The fused AITER kernel writes fp8 K/V and index keys; nvfp4 caches
-            # need the separate inserts in _insert_aiter_sparse_pa_kv.
-            use_fused_qknorm = (
-                not self.index_kv_nvfp4
-                and not self.sparse_kv_nvfp4
-                and rocm_aiter_ops.fused_qknorm_idxrqknorm_enabled(
-                    self.kv_cache_dtype, k_scale, v_scale
-                )
+            # The fused AITER kernel also writes the cache inserts; AITER builds
+            # without NVFP4 output fall back to _insert_aiter_sparse_pa_kv for
+            # nvfp4 caches.
+            use_fused_qknorm = rocm_aiter_ops.fused_qknorm_idxrqknorm_enabled(
+                self.kv_cache_dtype,
+                k_scale,
+                v_scale,
+                kv_nvfp4=self.sparse_kv_nvfp4,
+                index_nvfp4=self.index_kv_nvfp4,
             )
         if self.skip_index_topk:
             index_q = None
@@ -1137,6 +1138,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                         v_scale,
                         num_index_heads=self.num_idx_heads,
                         skip_index_branch=True,
+                        kv_nvfp4=self.sparse_kv_nvfp4,
                     )
                 else:
                     ops.fused_minimax_m3_qknorm_rope_kv_insert(
@@ -1227,6 +1229,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                         index_cache,
                         index_q,
                         index_slot_mapping,
+                        kv_nvfp4=self.sparse_kv_nvfp4,
+                        index_nvfp4=self.index_kv_nvfp4,
                     )
                 else:
                     ops.fused_minimax_m3_qknorm_rope_kv_insert(
