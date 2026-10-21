@@ -50,10 +50,57 @@ def minimax_m3_sparse_kv_nvfp4() -> bool:
     return fmt == "nvfp4"
 
 
+@cache
+def minimax_m3_sparse_kv_compact() -> bool:
+    """MINIMAX_M3_NVFP4_COMPACT_PAGES=1 (NVFP4 sparse KV only): allocate real
+    NVFP4 pages instead of fp8 ones. A 128-token block is 8 pages of 2304 B,
+    [K codes 1024 | K/V scales 256 | V codes 1024], so K and V of a page share
+    its page id with no page-16 rebase (see NVFP4_COMPACT_PAGE_BYTES).
+    """
+    return (
+        minimax_m3_sparse_kv_nvfp4()
+        and os.environ.get("MINIMAX_M3_NVFP4_COMPACT_PAGES", "0") == "1"
+    )
+
+
 # Per (page, head) chunk: [head_size // 16, 16 tokens, 8 B] codes, then on the
 # K side [16 tokens, head_size // 32, 4 B] E4M3 scales.
 _NVFP4_CODE_BYTES = 128 // 2 * ASM_PAGE_SIZE
 _NVFP4_SCALE_BYTES = 128 // 16 * 2 * ASM_PAGE_SIZE
+# One compact page: K codes, K/V scales, then V codes.
+NVFP4_COMPACT_V_OFFSET = _NVFP4_CODE_BYTES + _NVFP4_SCALE_BYTES
+NVFP4_COMPACT_PAGE_BYTES = NVFP4_COMPACT_V_OFFSET + _NVFP4_CODE_BYTES
+
+
+def minimax_m3_compact_kv_views(
+    kv_cache: torch.Tensor,  # fp8 [num_blocks, 2, block_size, C] with C = 72
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """fp8 K / V code views [pages, 1, 8, 16, 8] of a compact NVFP4 cache.
+
+    Both views address page ``p`` at ``p * NVFP4_COMPACT_PAGE_BYTES``; V starts
+    NVFP4_COMPACT_V_OFFSET bytes in, and K's scales sit right after its codes
+    where _nvfp4_kv_views expects them.
+    """
+    page = NVFP4_COMPACT_PAGE_BYTES
+    num_blocks = kv_cache.shape[0]
+    block_bytes = kv_cache[0].numel() * kv_cache.element_size()
+    if (
+        not kv_cache.is_contiguous()
+        or kv_cache.element_size() != 1
+        or block_bytes % page
+    ):
+        raise RuntimeError(
+            "MiniMax-M3 compact NVFP4 KV needs contiguous 1-byte blocks of whole "
+            f"{page} B pages, got {tuple(kv_cache.shape)} {kv_cache.dtype}"
+        )
+    num_pages = num_blocks * (block_bytes // page)
+    shape = (num_pages, 1, 128 // 16, ASM_PAGE_SIZE, 8)
+    stride = (page, page, 8 * ASM_PAGE_SIZE, 8, 1)
+    base = kv_cache.storage_offset()
+    return (
+        kv_cache.as_strided(shape, stride, base),
+        kv_cache.as_strided(shape, stride, base + NVFP4_COMPACT_V_OFFSET),
+    )
 
 
 def _nvfp4_kv_views(
@@ -191,8 +238,12 @@ def minimax_m3_insert_kv_nvfp4(
         k_cache.stride()[:2] != v_cache.stride()[:2]
     ):
         raise ValueError("MiniMax-M3 NVFP4 KV insert needs matching fp8 caches")
-    if k_cache.stride(1) != 128 * ASM_PAGE_SIZE:
-        raise ValueError("MiniMax-M3 NVFP4 KV insert needs 2048 B page chunks")
+    if k_cache.stride(1) != 128 * ASM_PAGE_SIZE and not (
+        num_kv_heads == 1 and k_cache.stride(1) == NVFP4_COMPACT_PAGE_BYTES
+    ):
+        raise ValueError(
+            "MiniMax-M3 NVFP4 KV insert needs 2048 B page chunks or compact pages"
+        )
     one = torch.ones(1, dtype=torch.float32, device=k.device)
     _insert_kv_nvfp4_kernel[(num_tokens, num_kv_heads)](
         k,
@@ -559,6 +610,12 @@ def minimax_m3_sparse_block_page_stride(
 PAGE16_SIDES_PER_BLOCK = 2
 
 
+def minimax_m3_page16_sides_per_block() -> int:
+    """PAGE16_SIDES_PER_BLOCK, or 1 for compact NVFP4 pages, whose K and V
+    share one page id per 16 tokens."""
+    return 1 if minimax_m3_sparse_kv_compact() else PAGE16_SIDES_PER_BLOCK
+
+
 def minimax_m3_rebase_block_table_to_page16(
     block_table: torch.Tensor,
     out: torch.Tensor | None = None,
@@ -575,7 +632,7 @@ def minimax_m3_rebase_block_table_to_page16(
     """
     if out is None:
         out = torch.empty_like(block_table)
-    return torch.mul(block_table, PAGE16_SIDES_PER_BLOCK, out=out)
+    return torch.mul(block_table, minimax_m3_page16_sides_per_block(), out=out)
 
 
 def _gluon_scale_arg(

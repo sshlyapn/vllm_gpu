@@ -14,6 +14,7 @@ main attention.
 ``select_indexer_impl_cls``) and delegates ``forward`` to it.
 """
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -42,6 +43,7 @@ else:
         minimax_m3_index_topk,
     )
 
+from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -129,6 +131,16 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
         self.indexer_kv_dtype = indexer_kv_dtype
         # Side-cache storage dtype: bf16, or e4m3 for the fp8 score path.
         self.dtype = cache_dtype
+        # MINIMAX_M3_NVFP4_COMPACT_PAGES=1 with AITER_MSA_INDEX_KV_FMT=nvfp4:
+        # allocate only the nvfp4 page (codes + scales, 72 B per token at dim
+        # 128) and bind it as [B, page bytes], which the AITER writer and
+        # scorer take as-is, instead of an fp8 page holding one at its head.
+        self.compact_nvfp4 = (
+            cache_dtype == torch.float8_e4m3fn
+            and os.environ.get("MINIMAX_M3_NVFP4_COMPACT_PAGES", "0") == "1"
+            and os.environ.get("AITER_MSA_INDEX_KV_FMT", "").strip().lower()
+            == "nvfp4"
+        )
         self.prefix = prefix
         self.cache_config = cache_config
         # Impl-chosen backend -> each impl gets its own builder (get_attn_backend).
@@ -141,13 +153,20 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         # [B, H=1, N, C] -> [B, N, C]
         self.kv_cache = kv_cache.squeeze(1)
+        if self.compact_nvfp4 and self.kv_cache.numel():
+            # [B, N, C] -> [B, N * C], one nvfp4 page per block.
+            self.kv_cache = self.kv_cache.flatten(1)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Key-only: MLAAttentionSpec budgets one vector/token (not 2x for K+V).
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
-            head_size=self.head_dim,
+            head_size=(
+                nvfp4_kv_cache_full_dim(self.head_dim)
+                if self.compact_nvfp4
+                else self.head_dim
+            ),
             dtype=self.dtype,
             cache_role=SparseCacheRole.INDEXER,
         )

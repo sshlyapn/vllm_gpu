@@ -130,8 +130,8 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
         decode_sparse_table: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         from vllm.models.minimax_m3.amd.ops.sparse_pa import (
-            PAGE16_SIDES_PER_BLOCK,
             PAGES_PER_SPARSE_BLOCK,
+            minimax_m3_page16_sides_per_block,
             minimax_m3_sparse_attn_decode_aiter,
             minimax_m3_sparse_attn_prefill_aiter,
             minimax_m3_sparse_block_page_stride,
@@ -172,7 +172,7 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
             # only disagree if the resolved layout gives each side its own
             # plane, and a silent disagreement reads unrelated pages.
             stride = minimax_m3_sparse_block_page_stride(k_cache, v_cache)
-            expected = PAGES_PER_SPARSE_BLOCK * PAGE16_SIDES_PER_BLOCK
+            expected = PAGES_PER_SPARSE_BLOCK * minimax_m3_page16_sides_per_block()
             if stride != expected:
                 raise RuntimeError(
                     "MiniMax-M3 AITER sparse PA: the indexer emitted a page "

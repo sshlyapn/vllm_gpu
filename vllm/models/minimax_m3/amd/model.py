@@ -105,7 +105,9 @@ from vllm.models.minimax_m3.amd.ops import (
 from vllm.models.minimax_m3.amd.ops.sparse_pa import (
     ASM_PAGE_SIZE,
     minimax_m3_alloc_sparse_block_table,
+    minimax_m3_compact_kv_views,
     minimax_m3_sparse_block_page_stride,
+    minimax_m3_sparse_kv_compact,
     minimax_m3_sparse_kv_nvfp4,
 )
 from vllm.models.minimax_m3.amd.sparse_attention_msa import (
@@ -133,7 +135,10 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
-from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.torch_utils import (
+    kv_cache_dtype_str_to_dtype,
+    nvfp4_kv_cache_full_dim,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -864,6 +869,15 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 "and an fp8 KV cache; unset it for this config "
                 f"(layer {self.layer_name})"
             )
+        self.sparse_kv_compact = minimax_m3_sparse_kv_compact()
+        if self.sparse_kv_compact and (
+            self.num_kv_heads != 1 or self.head_dim != 128
+        ):
+            raise ValueError(
+                "MINIMAX_M3_NVFP4_COMPACT_PAGES=1 needs one KV head of dim 128 "
+                f"per rank, got {self.num_kv_heads} x {self.head_dim} "
+                f"(layer {self.layer_name})"
+            )
 
         # Register the main K/V cache so the KV-cache manager allocates it.
         compilation_config = vllm_config.compilation_config
@@ -883,6 +897,10 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         kv_bytes = (
             self.num_kv_heads * self.head_dim * self.kv_cache_torch_dtype.itemsize
         )
+        if sparse_pa and self.sparse_kv_compact:
+            # NVFP4 codes + E4M3 scales per token and side, the same 72 B the
+            # native NVFP4 KV spec uses (see minimax_m3_sparse_kv_compact).
+            kv_bytes = nvfp4_kv_cache_full_dim(self.head_dim)
         return FullAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=self.num_kv_heads,
@@ -903,6 +921,13 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         kv_cache = self.kv_cache
         if is_quantized_kv_cache(self.kv_cache_dtype):
             kv_cache = kv_cache.view(self.impl.kv_cache_fp8_dtype)
+        if self.sparse_kv_compact:
+            self.kv_cache_k, self.kv_cache_v = minimax_m3_compact_kv_views(kv_cache)
+            self._aiter_sparse_pa_block_page_stride = (
+                minimax_m3_sparse_block_page_stride(self.kv_cache_k, self.kv_cache_v)
+            )
+            self._aiter_sparse_pa_cache_data_ptr = self.kv_cache.data_ptr()
+            return
         key_cache, value_cache = kv_cache.unbind(1)
 
         x = 16 // kv_cache.element_size()
