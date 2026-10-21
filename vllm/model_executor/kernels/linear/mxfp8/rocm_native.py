@@ -9,6 +9,8 @@ of that is dequantized to BF16 once at load and served by a plain linear
 instead, since ``can_implement`` does not filter on K.
 """
 
+import os
+
 import torch
 from torch.nn.parameter import Parameter
 
@@ -24,6 +26,10 @@ from vllm.triton_utils import tl, triton
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 from .rocm_block32_gemm import BLOCK_ROWS, rocm_mxfp8_block32_gemm
+
+# Route through AITER gemm_a8w8_blockscale_bpreshuffle (FlyDSL MXFP8 bmm, 1x32
+# weight scales, AITER #5896 + #6060) instead of the Triton kernel below.
+_USE_AITER_BPRESHUFFLE = os.environ.get("VLLM_ROCM_MXFP8_AITER_BPRESHUFFLE") == "1"
 
 
 @triton.jit
@@ -251,7 +257,17 @@ class RocmDotScaledMxfp8LinearKernel(Mxfp8LinearKernel):
         block_scale = (
             None if envs.VLLM_BATCH_INVARIANT else _as_block32_scale(weight_scale)
         )
-        if block_scale is not None:
+        layer.mxfp8_aiter_bpreshuffle = (
+            _USE_AITER_BPRESHUFFLE
+            and block_scale is None
+            and N % 16 == 0
+            and K % 128 == 0
+        )
+        if layer.mxfp8_aiter_bpreshuffle:
+            from aiter.ops.shuffle import shuffle_weight
+
+            weight = shuffle_weight(weight.contiguous(), layout=(16, 16))
+        elif block_scale is not None:
             # Checkpoints with 32x32 scale blocks (DeepSeek V4/V4.1) get them
             # back from the loader expanded per row; keep the blocks and use
             # the block-scaled GEMM, which also handles any K % 32 == 0.
@@ -274,7 +290,18 @@ class RocmDotScaledMxfp8LinearKernel(Mxfp8LinearKernel):
             )
         out_shape = (*x.shape[:-1], layer.weight.shape[0])
         x2d = x.reshape(-1, x.shape[-1])
-        if layer.weight_scale.shape[0] != layer.weight.shape[0]:
+        if getattr(layer, "mxfp8_aiter_bpreshuffle", False):
+            from vllm._aiter_ops import rocm_aiter_ops
+
+            x_q, x_scale = mxfp8_e4m3_quantize(x2d)
+            out = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+                x_q,
+                layer.weight,
+                x_scale.view(torch.float8_e8m0fnu),
+                layer.weight_scale.view(torch.float8_e8m0fnu),
+                x.dtype,
+            )
+        elif layer.weight_scale.shape[0] != layer.weight.shape[0]:
             # One scale row per 32 weight rows (see process_weights_after_loading).
             x_q, x_scale = mxfp8_e4m3_quantize(x2d)
             out = rocm_mxfp8_block32_gemm(
