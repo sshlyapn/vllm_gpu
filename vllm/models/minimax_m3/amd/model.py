@@ -157,6 +157,18 @@ def _sparse_attention_layer_ordinals(config: PreTrainedConfig) -> dict[int, int]
     }
 
 
+def _aiter_index_kv_nvfp4() -> bool:
+    """Experimental AITER_MSA_INDEX_KV_FMT=nvfp4: the index keys are stored as
+    an nvfp4 page at the head of every fp8 index-cache page, which the AITER
+    indexer reads. The cache keeps its fp8 shape, so only the bytes read shrink.
+    """
+    try:
+        from aiter.ops.msa_block_select import KV_FMT_NVFP4, index_kv_fmt
+    except ImportError:
+        return False
+    return index_kv_fmt() == KV_FMT_NVFP4
+
+
 def _should_skip_index_topk(config: PreTrainedConfig, layer_id: int) -> bool:
     """ATOM ``index_topk_freq`` (cross-layer index sharing).
 
@@ -807,6 +819,17 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 sparse_ctx_buffer=self.sparse_ctx_buffer,
                 **indexer_kwargs,
             )
+        # Only the AITER indexer reads nvfp4 keys, and only the AITER sparse-PA
+        # insert path writes them; anything else would read them as fp8.
+        self.index_kv_nvfp4 = _aiter_index_kv_nvfp4()
+        if self.index_kv_nvfp4 and not (
+            self.use_aiter_sparse_pa and isinstance(self.indexer, MiniMaxM3AiterIndexer)
+        ):
+            raise ValueError(
+                "AITER_MSA_INDEX_KV_FMT=nvfp4 needs the AITER indexer and the "
+                "AITER sparse PA path (fp8 indexer_kv_dtype); unset it for "
+                f"this config (layer {self.layer_name})"
+            )
 
         # Register the main K/V cache so the KV-cache manager allocates it.
         compilation_config = vllm_config.compilation_config
@@ -958,6 +981,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         index_cache = self.indexer.index_cache.kv_cache
         if index_cache.numel() == 0:
             return
+        if self.index_kv_nvfp4:
+            from aiter.ops.triton.msa_index_cache import msa_index_cache_insert
+
+            msa_index_cache_insert(index_k, index_cache, index_slot_mapping)
+            return
         minimax_m3_insert_index_cache(index_k, index_cache, index_slot_mapping)
 
     def forward(
@@ -1001,8 +1029,13 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             )
             k_scale = getattr(self, "_k_scale", None)
             v_scale = getattr(self, "_v_scale", None)
-            use_fused_qknorm = rocm_aiter_ops.fused_qknorm_idxrqknorm_enabled(
-                self.kv_cache_dtype, k_scale, v_scale
+            # The fused AITER kernel writes fp8 index keys; nvfp4 keys need the
+            # separate insert in _insert_aiter_sparse_pa_kv.
+            use_fused_qknorm = (
+                not self.index_kv_nvfp4
+                and rocm_aiter_ops.fused_qknorm_idxrqknorm_enabled(
+                    self.kv_cache_dtype, k_scale, v_scale
+                )
             )
         if self.skip_index_topk:
             index_q = None
