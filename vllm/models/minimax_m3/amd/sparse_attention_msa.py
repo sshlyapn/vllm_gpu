@@ -60,6 +60,9 @@ class MiniMaxM3SparseAiterPAPrefillMetadata(MiniMaxM3SparsePrefillMetadata):
     page16_block_table: torch.Tensor | None = None
     # dqC row groups that fit the reserved workspace; see minimax_m3_dqc_groups.
     dqc_groups: list[tuple[int, int, int, int, int]] | None = None
+    # dqC workspace block table; see minimax_m3_dqc_ws_block_table. When set,
+    # it is also ``page16_block_table``, so the top-k emits workspace ids.
+    dqc_ws_block_table: torch.Tensor | None = None
 
 
 @dataclass
@@ -113,6 +116,7 @@ class MiniMaxM3SparseAiterPAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
         from vllm.models.minimax_m3.amd.ops.sparse_pa import (
             minimax_m3_dqc_enabled,
             minimax_m3_dqc_groups,
+            minimax_m3_dqc_ws_block_table,
             minimax_m3_rebase_block_table_to_page16,
         )
 
@@ -141,23 +145,34 @@ class MiniMaxM3SparseAiterPAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
                 page16_block_table=page16[:nd],
             )
         if metadata.prefill is not None:
-            dqc_groups = None
+            dqc_groups = dqc_ws_bt = None
+            prefill_page16 = page16[nd:]
             if minimax_m3_dqc_enabled():
                 n = common_attn_metadata.num_reqs
                 seq_ub = common_attn_metadata.seq_lens_cpu_upper_bound
                 assert seq_ub is not None
                 qsl = common_attn_metadata.query_start_loc_cpu[nd : n + 1]
+                prefill_seq_ub = seq_ub[nd:n].tolist()
                 dqc_groups = minimax_m3_dqc_groups(
-                    seq_ub[nd:n].tolist(),
+                    prefill_seq_ub,
                     (qsl - qsl[0]).tolist(),
                     self.dqc_budget_blocks,
                 )
+                # Once per step from the CPU upper bound the groups were
+                # budgeted on (no sync). Handed to the top-k as the prefill
+                # page-16 table, so every layer's sparse table already holds
+                # workspace ids.
+                dqc_ws_bt = minimax_m3_dqc_ws_block_table(
+                    prefill_seq_ub, dqc_groups, block_table.device
+                )
+                prefill_page16 = dqc_ws_bt
                 if _DQC_LOG_GROUPS:
                     _log_dqc_groups(n - nd, len(dqc_groups))
             metadata.prefill = MiniMaxM3SparseAiterPAPrefillMetadata(
                 **vars(metadata.prefill),
-                page16_block_table=page16[nd:],
+                page16_block_table=prefill_page16,
                 dqc_groups=dqc_groups,
+                dqc_ws_block_table=dqc_ws_bt,
             )
         return metadata
 
@@ -330,5 +345,6 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
                 total_kv_blocks=p.total_kv_blocks,
                 dqc_groups=p.dqc_groups,
                 dqc_ws_pages=self.dqc_ws_pages or None,
+                dqc_ws_block_table=p.dqc_ws_block_table,
             )
         return output
