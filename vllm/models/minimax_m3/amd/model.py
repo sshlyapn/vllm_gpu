@@ -101,6 +101,7 @@ from vllm.models.minimax_m3.amd.ops.sparse_pa import (
     ASM_PAGE_SIZE,
     minimax_m3_alloc_sparse_block_table,
     minimax_m3_sparse_block_page_stride,
+    minimax_m3_sparse_kv_nvfp4,
 )
 from vllm.models.minimax_m3.amd.sparse_attention_msa import (
     MiniMaxM3SparseAiterPADecodeMetadata,
@@ -830,6 +831,17 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
                 "AITER sparse PA path (fp8 indexer_kv_dtype); unset it for "
                 f"this config (layer {self.layer_name})"
             )
+        # Same for the sparse layers' main K/V: only the AITER sparse PA insert
+        # writes nvfp4 into the fp8 pages, and only its attend reads them.
+        self.sparse_kv_nvfp4 = minimax_m3_sparse_kv_nvfp4()
+        if self.sparse_kv_nvfp4 and not (
+            self.use_aiter_sparse_pa and is_quantized_kv_cache(self.kv_cache_dtype)
+        ):
+            raise ValueError(
+                "MINIMAX_M3_SPARSE_KV_FMT=nvfp4 needs the AITER sparse PA path "
+                "and an fp8 KV cache; unset it for this config "
+                f"(layer {self.layer_name})"
+            )
 
         # Register the main K/V cache so the KV-cache manager allocates it.
         compilation_config = vllm_config.compilation_config
@@ -958,24 +970,36 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
 
         from vllm.models.minimax_m3.amd.ops.sparse_pa import (
             minimax_m3_insert_index_cache,
+            minimax_m3_insert_kv_nvfp4,
         )
 
-        kv_cache_dtype = (
-            self.kv_cache_dtype
-            if is_quantized_kv_cache(self.kv_cache_dtype)
-            else "auto"
-        )
-        reshape_and_cache(
-            _kv_insert_operand(k),
-            _kv_insert_operand(v),
-            key_cache,
-            value_cache,
-            slot_mapping,
-            kv_cache_dtype=kv_cache_dtype,
-            k_scale=getattr(self, "_k_scale", None),
-            v_scale=getattr(self, "_v_scale", None),
-            asm_layout=True,
-        )
+        if self.sparse_kv_nvfp4:
+            minimax_m3_insert_kv_nvfp4(
+                k,
+                v,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                k_scale=getattr(self, "_k_scale", None),
+                v_scale=getattr(self, "_v_scale", None),
+            )
+        else:
+            kv_cache_dtype = (
+                self.kv_cache_dtype
+                if is_quantized_kv_cache(self.kv_cache_dtype)
+                else "auto"
+            )
+            reshape_and_cache(
+                _kv_insert_operand(k),
+                _kv_insert_operand(v),
+                key_cache,
+                value_cache,
+                slot_mapping,
+                kv_cache_dtype=kv_cache_dtype,
+                k_scale=getattr(self, "_k_scale", None),
+                v_scale=getattr(self, "_v_scale", None),
+                asm_layout=True,
+            )
         if index_k is None or index_slot_mapping is None:
             return
         index_cache = self.indexer.index_cache.kv_cache
@@ -1029,10 +1053,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             )
             k_scale = getattr(self, "_k_scale", None)
             v_scale = getattr(self, "_v_scale", None)
-            # The fused AITER kernel writes fp8 index keys; nvfp4 keys need the
-            # separate insert in _insert_aiter_sparse_pa_kv.
+            # The fused AITER kernel writes fp8 K/V and index keys; nvfp4 caches
+            # need the separate inserts in _insert_aiter_sparse_pa_kv.
             use_fused_qknorm = (
                 not self.index_kv_nvfp4
+                and not self.sparse_kv_nvfp4
                 and rocm_aiter_ops.fused_qknorm_idxrqknorm_enabled(
                     self.kv_cache_dtype, k_scale, v_scale
                 )

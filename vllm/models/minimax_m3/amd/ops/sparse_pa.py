@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """AITER page-16 sparse paged-attention helpers for MiniMax-M3 on ROCm."""
 
+import os
+from functools import cache
+
 import torch
 
 try:
@@ -29,6 +32,185 @@ _FP8_DTYPES = {
 
 def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
     return kv_cache.dtype in _FP8_DTYPES
+
+
+@cache
+def minimax_m3_sparse_kv_nvfp4() -> bool:
+    """Experimental MINIMAX_M3_SPARSE_KV_FMT=nvfp4 for the sparse layers.
+
+    The fp8 KV cache keeps its shape and size. The first 1024 B of each
+    2048 B (page, head) chunk of the K side hold the NVFP4 K codes and the
+    next 256 B the K and V scales; the first 1024 B of the V side chunk hold
+    the NVFP4 V codes. That is the layout pa_decode_gluon reads with
+    kv_block_scale, and only those 2304 of 4096 B per page are touched.
+    """
+    fmt = os.environ.get("MINIMAX_M3_SPARSE_KV_FMT", "fp8").lower()
+    if fmt not in ("fp8", "nvfp4"):
+        raise ValueError(f"MINIMAX_M3_SPARSE_KV_FMT must be fp8 or nvfp4, got {fmt}")
+    return fmt == "nvfp4"
+
+
+# Per (page, head) chunk: [head_size // 16, 16 tokens, 8 B] codes, then on the
+# K side [16 tokens, head_size // 32, 4 B] E4M3 scales.
+_NVFP4_CODE_BYTES = 128 // 2 * ASM_PAGE_SIZE
+_NVFP4_SCALE_BYTES = 128 // 16 * 2 * ASM_PAGE_SIZE
+
+
+def _nvfp4_kv_views(
+    k_cache: torch.Tensor,  # fp8 [pages, 1, head_size // 16, 16, 16]
+    v_cache: torch.Tensor,  # fp8 [pages, 1, 1, head_size, 16]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """NVFP4 K codes, V codes and K/V scales inside the fp8 pages."""
+    k8, v8 = k_cache.view(torch.uint8), v_cache.view(torch.uint8)
+    page = k8.stride(0)
+    if v8.stride(0) != page or page < _NVFP4_CODE_BYTES + _NVFP4_SCALE_BYTES:
+        raise ValueError("MiniMax-M3 NVFP4 sparse KV needs equal fp8 page strides")
+    code_shape = (128 // 16, ASM_PAGE_SIZE, 8)
+    code_stride = (page, page, 8 * ASM_PAGE_SIZE, 8, 1)
+    return (
+        k8.as_strided((k8.shape[0], 1, *code_shape), code_stride),
+        v8.as_strided((v8.shape[0], 1, *code_shape), code_stride),
+        k8.as_strided(
+            (k8.shape[0], 1, ASM_PAGE_SIZE, 128 // 32, 4),
+            (page, page, 16, 4, 1),
+            k8.storage_offset() + _NVFP4_CODE_BYTES,
+        ),
+    )
+
+
+@triton.jit
+def _nvfp4_quant_row(src, scale):
+    """NVFP4 words and E4M3 scales of one 128-wide head row.
+
+    Returns int32 words [8 blocks, 2]; byte j of word g of block s holds, for
+    A = elements s * 16 + g * 8 + 0..3 and B = the next 4, |A_j| | sign(A_j)
+    << 7 | |B_j| << 4 | sign(B_{j-1 mod 4}) << 3. Also returns the [8] scale
+    bytes. Rounding matches the reference quantizer: scale E4M3_rn(amax / 6)
+    clamped to [2^-9, 448], codes RNE onto the E2M1 grid.
+    """
+    s = tl.arange(0, 8)[:, None, None]
+    g = tl.arange(0, 2)[None, :, None]
+    j = tl.arange(0, 4)[None, None, :]
+    a = tl.math.div_rn(tl.load(src + s * 16 + g * 8 + j).to(tl.float32), scale)
+    b = tl.math.div_rn(tl.load(src + s * 16 + g * 8 + 4 + j).to(tl.float32), scale)
+    amax = tl.max(tl.max(tl.maximum(tl.abs(a), tl.abs(b)), axis=2), axis=1)
+    sf = tl.math.div_rn(tl.maximum(amax, 1e-12), 6.0)
+    sf = tl.minimum(sf, 448.0).to(tl.float8e4nv).to(tl.float32)
+    sf = tl.maximum(sf, 1.0 / 512).to(tl.float8e4nv)
+    sf32 = sf.to(tl.float32)[:, None, None]
+
+    ma = tl.minimum(tl.abs(tl.math.div_rn(a, sf32)), 6.0)
+    mb = tl.minimum(tl.abs(tl.math.div_rn(b, sf32)), 6.0)
+    a_mag = (
+        (ma > 0.25).to(tl.uint32)
+        + (ma >= 0.75).to(tl.uint32)
+        + (ma > 1.25).to(tl.uint32)
+        + (ma >= 1.75).to(tl.uint32)
+        + (ma > 2.5).to(tl.uint32)
+        + (ma >= 3.5).to(tl.uint32)
+        + (ma > 5.0).to(tl.uint32)
+    )
+    b_mag = (
+        (mb > 0.25).to(tl.uint32)
+        + (mb >= 0.75).to(tl.uint32)
+        + (mb > 1.25).to(tl.uint32)
+        + (mb >= 1.75).to(tl.uint32)
+        + (mb > 2.5).to(tl.uint32)
+        + (mb >= 3.5).to(tl.uint32)
+        + (mb > 5.0).to(tl.uint32)
+    )
+    a_neg = (a.to(tl.int32, bitcast=True) < 0).to(tl.uint32)
+    b_neg = (b.to(tl.int32, bitcast=True) < 0).to(tl.uint32)
+    shift = (j * 8).to(tl.uint32)
+    word = tl.sum((a_mag | (a_neg << 7) | (b_mag << 4)) << shift, axis=2)
+    b_sign = tl.sum((b_neg << 3) << shift, axis=2)
+    word = word | (b_sign << 8) | (b_sign >> 24)
+    return word.to(tl.int32, bitcast=True), sf.to(tl.uint8, bitcast=True)
+
+
+@triton.jit
+def _insert_kv_nvfp4_kernel(
+    k_ptr,  # [num_tokens, num_kv_heads, 128]
+    v_ptr,
+    k_cache_ptr,  # uint8, page-16 K side
+    v_cache_ptr,  # uint8, page-16 V side
+    slot_mapping_ptr,  # [num_tokens], page-16 slots
+    k_scale_ptr,
+    v_scale_ptr,
+    stride_k_t,
+    stride_k_h,
+    stride_v_t,
+    stride_v_h,
+    stride_c_page,
+    stride_c_head,
+    SCALE_OFFSET: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    slot = tl.load(slot_mapping_ptr + pid_t)
+    if slot < 0:
+        return
+    page = slot // 16
+    tok = slot % 16
+    chunk = page.to(tl.int64) * stride_c_page + pid_h * stride_c_head
+
+    k_words, k_sf = _nvfp4_quant_row(
+        k_ptr + pid_t * stride_k_t + pid_h * stride_k_h, tl.load(k_scale_ptr)
+    )
+    v_words, v_sf = _nvfp4_quant_row(
+        v_ptr + pid_t * stride_v_t + pid_h * stride_v_h, tl.load(v_scale_ptr)
+    )
+    # Words of block s for this token at int32 offset s * 32 + tok * 2.
+    w = tl.arange(0, 8)[:, None] * 32 + tok * 2 + tl.arange(0, 2)[None, :]
+    tl.store((k_cache_ptr + chunk).to(tl.pointer_type(tl.int32)) + w, k_words)
+    tl.store((v_cache_ptr + chunk).to(tl.pointer_type(tl.int32)) + w, v_words)
+    # Scale bytes of this token: [s % 4, :] = K_s, K_s+4, V_s, V_s+4.
+    s = tl.arange(0, 8)
+    sf_dst = k_cache_ptr + chunk + SCALE_OFFSET + tok * 16 + (s % 4) * 4 + s // 4
+    tl.store(sf_dst, k_sf)
+    tl.store(sf_dst + 2, v_sf)
+
+
+@torch.no_grad()
+def minimax_m3_insert_kv_nvfp4(
+    k: torch.Tensor,  # [num_tokens, num_kv_heads, 128]
+    v: torch.Tensor,
+    k_cache: torch.Tensor,  # fp8 [pages, num_kv_heads, 8, 16, 16]
+    v_cache: torch.Tensor,  # fp8 [pages, num_kv_heads, 1, 128, 16]
+    slot_mapping: torch.Tensor,  # [num_tokens], page-16 slots
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+) -> None:
+    """Quantize K/V to NVFP4 in place of fp8 (see minimax_m3_sparse_kv_nvfp4)."""
+    num_tokens, num_kv_heads, head_size = k.shape
+    if num_tokens == 0:
+        return
+    if head_size != 128 or k.stride(2) != 1 or v.stride(2) != 1:
+        raise ValueError("MiniMax-M3 NVFP4 KV insert needs contiguous head_dim 128")
+    if not _is_fp8_kv_cache_tensor(k_cache) or (
+        k_cache.stride()[:2] != v_cache.stride()[:2]
+    ):
+        raise ValueError("MiniMax-M3 NVFP4 KV insert needs matching fp8 caches")
+    if k_cache.stride(1) != 128 * ASM_PAGE_SIZE:
+        raise ValueError("MiniMax-M3 NVFP4 KV insert needs 2048 B page chunks")
+    one = torch.ones(1, dtype=torch.float32, device=k.device)
+    _insert_kv_nvfp4_kernel[(num_tokens, num_kv_heads)](
+        k,
+        v,
+        k_cache.view(torch.uint8),
+        v_cache.view(torch.uint8),
+        slot_mapping,
+        one if k_scale is None else k_scale,
+        one if v_scale is None else v_scale,
+        k.stride(0),
+        k.stride(1),
+        v.stride(0),
+        v.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        SCALE_OFFSET=_NVFP4_CODE_BYTES,
+        num_warps=1,
+    )
 
 
 @triton.jit
@@ -587,6 +769,20 @@ def _run_gluon_decode(
     else:
         k_scale_arg = v_scale_arg = None
 
+    # Only passed when set: stock AITER has no kv_block_scale argument.
+    nvfp4_kwargs: dict[str, torch.Tensor] = {}
+    if is_fp8 and minimax_m3_sparse_kv_nvfp4():
+        if hkv != 1:
+            raise ValueError("MiniMax-M3 NVFP4 sparse KV needs one KV head")
+        k_cache_view, v_cache_view, nvfp4_kwargs["kv_block_scale"] = (
+            _nvfp4_kv_views(k_cache_view, v_cache_view)
+        )
+        one = torch.ones(1, dtype=torch.float32, device=q.device)
+        k_scale_arg = one if k_scale_arg is None else k_scale_arg
+        v_scale_arg = one if v_scale_arg is None else v_scale_arg
+        if k_scale_arg.numel() != 1 or v_scale_arg.numel() != 1:
+            raise ValueError("MiniMax-M3 NVFP4 sparse KV needs scalar KV scales")
+
     pa_decode_gluon(
         output=out_view,
         query=q_view,
@@ -609,4 +805,5 @@ def _run_gluon_decode(
         sinks=None,
         sliding_window=-1,
         ps=True,
+        **nvfp4_kwargs,
     )
