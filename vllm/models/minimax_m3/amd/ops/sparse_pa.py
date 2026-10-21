@@ -657,6 +657,201 @@ def minimax_m3_sparse_attn_decode_aiter(
     )
 
 
+@cache
+def minimax_m3_sparse_kv_prefill_dq() -> bool:
+    """MINIMAX_M3_SPARSE_KV_PREFILL_DQ (default 1, NVFP4 KV only): prefill
+    dequantizes every context page of the step's requests to fp8 once (dqC)
+    and runs the fp8 kernel on that workspace; 0 runs the fused NVFP4 kernel.
+    """
+    return os.environ.get("MINIMAX_M3_SPARSE_KV_PREFILL_DQ", "1") == "1"
+
+
+@triton.jit
+def _dqc_page(src, dst, kw, vw, ksc, lut, k8, v8, page_w):
+    """Dequantize NVFP4 page ``src`` (K and V) into fp8 workspace page ``dst``.
+
+    kw / vw: int32 views of the K / V sides, ksc: uint8 view of the K side,
+    page_w: page stride in int32 words. Output layouts: k8 [S, 8, 16, 16]
+    (dim group, token, element), v8 [S, 128, 16] (dim, token).
+    """
+    j = tl.arange(0, 8)[:, None, None]
+    t = tl.arange(0, 16)[None, :, None]
+    e = tl.arange(0, 16)[None, None, :]
+    grp = e // 8
+    hi = (e // 4) % 2
+    jj = e % 4
+    src = src.to(tl.int64)
+    dst = dst.to(tl.int64)
+    word_off = src * page_w + j * 32 + t * 2 + grp
+    sf_off = src * page_w * 4 + 1024 + t * 16 + (j % 4) * 4 + j // 4
+    for side in tl.static_range(2):
+        if side == 0:
+            w = tl.load(kw + word_off)
+            s = tl.load(ksc + sf_off)
+        else:
+            w = tl.load(vw + word_off)
+            s = tl.load(ksc + sf_off + 2)
+        b = (w >> (8 * jj)) & 0xFF
+        nb = (w >> (8 * ((jj + 1) % 4))) & 0xFF
+        mag = tl.where(hi == 0, b & 7, (b >> 4) & 7)
+        sign = tl.where(hi == 0, b >> 7, (nb >> 3) & 1)
+        lv = tl.load(lut + s.to(tl.int32))
+        val = ((lv >> (mag * 8).to(tl.int64)) & 0xFF).to(tl.int32) | (sign << 7)
+        val = val.to(tl.uint8)
+        if side == 0:
+            tl.store(k8 + dst * 2048 + j * 256 + t * 16 + e, val)
+        else:
+            tl.store(v8 + dst * 2048 + (j * 16 + e) * 16 + t, val)
+
+
+@triton.jit
+def _dqc_context_kernel(
+    block_table,  # [num_prefills, max_blocks] int32, logical 128-token blocks
+    stride_bt,
+    seq_lens,  # [num_prefills] int32
+    blk_start,  # [num_prefills] int32, exclusive cumsum of blocks per request
+    slot_of,  # [num_pages] int32, page id -> workspace page
+    kw,
+    vw,
+    ksc,
+    lut,
+    k8,
+    v8,
+    page_w,
+    BLOCK_PAGE_STRIDE: tl.constexpr,
+    PAGES_PER_BLOCK: tl.constexpr,
+):
+    r = tl.program_id(0)
+    b = tl.program_id(1)
+    jp = tl.program_id(2)
+    if b * (PAGES_PER_BLOCK * 16) < tl.load(seq_lens + r):
+        blk = tl.load(block_table + r * stride_bt + b)
+        page = blk * BLOCK_PAGE_STRIDE + jp
+        dst = (tl.load(blk_start + r) + b) * PAGES_PER_BLOCK + jp
+        _dqc_page(page, dst, kw, vw, ksc, lut, k8, v8, page_w)
+        tl.store(slot_of + page, dst)
+
+
+@triton.jit
+def _dqc_remap_kernel(
+    sparse_bt,  # [rows, cols] int32 page ids
+    stride_sbt,
+    sparse_ctx,  # [rows] int32 attended tokens
+    new_bt,
+    stride_nbt,
+    slot_of,
+    cols,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    in_row = c < cols
+    used = c < (tl.load(sparse_ctx + row) + 15) // 16
+    page = tl.load(sparse_bt + row * stride_sbt + c, mask=used, other=0)
+    slot = tl.load(slot_of + page, mask=used, other=0)
+    tl.store(new_bt + row * stride_nbt + c, tl.where(used, slot, 0), mask=in_row)
+
+
+_DQC_STATE: dict = {}
+
+
+def _nvfp4_lut(device: torch.device) -> torch.Tensor:
+    """int64 [256]: byte m of entry s = E4M3(|E2M1[m]| * E4M3(s)), clamped."""
+    key = ("lut", device)
+    if key not in _DQC_STATE:
+        e2m1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+        sf = torch.arange(256, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
+        sf = torch.nan_to_num(sf, nan=0.0)
+        v = (e2m1[None, :] * sf[:, None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+        lut = v.view(torch.uint8).contiguous().view(torch.int64).view(256)
+        _DQC_STATE[key] = lut.to(device)
+    return _DQC_STATE[key]
+
+
+def _dqc_buffers(device, num_pages: int, ws_pages: int):
+    key = ("buf", device)
+    st = _DQC_STATE.get(key)
+    if st is None or st[0].numel() < num_pages or st[1].shape[0] < ws_pages:
+        if st is not None:
+            ws_pages = max(ws_pages, st[1].shape[0])
+            num_pages = max(num_pages, st[0].numel())
+        ws_pages = max(ws_pages, 1024)
+        slot_of = torch.zeros(num_pages, dtype=torch.int32, device=device)
+        k8 = torch.empty(ws_pages, 1, 8, 16, 16, dtype=torch.uint8, device=device)
+        v8 = torch.empty(ws_pages, 1, 1, 128, 16, dtype=torch.uint8, device=device)
+        st = (slot_of, k8, v8)
+        _DQC_STATE[key] = st
+    return st
+
+
+def minimax_m3_sparse_kv_dequant_context(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,  # [num_prefills, max_blocks] logical blocks
+    seq_lens: torch.Tensor,  # [num_prefills] int32
+    max_seq_len: int,
+    total_kv_blocks: int,
+    sparse_bt: torch.Tensor,
+    sparse_ctx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """dqC: NVFP4 context pages -> fp8 workspace pages + remapped page table.
+
+    Returns (fp8 K workspace, fp8 V workspace, page table in workspace ids).
+    """
+    nphys16, hkv = k_cache.shape[0], k_cache.shape[1]
+    if hkv != 1:
+        raise ValueError("MiniMax-M3 NVFP4 sparse KV needs one KV head")
+    k_view = k_cache.view(nphys16, 1, *k_cache.shape[2:])
+    v_view = v_cache.view(v_cache.shape[0], 1, *v_cache.shape[2:])
+    k_u8, v_u8 = k_view.view(torch.uint8), v_view.view(torch.uint8)
+    page = k_u8.stride(0)
+    if v_u8.stride(0) != page or page % 4 or page < 1280:
+        raise ValueError("MiniMax-M3 NVFP4 sparse KV needs equal fp8 page strides")
+    stride = minimax_m3_sparse_block_page_stride(k_cache, v_cache)
+    dev = k_cache.device
+    ws_pages = total_kv_blocks * PAGES_PER_SPARSE_BLOCK
+    slot_of, k8, v8 = _dqc_buffers(dev, nphys16, ws_pages)
+    nblk = (seq_lens + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE
+    blk_start = (torch.cumsum(nblk, 0) - nblk).to(torch.int32)
+    max_blocks = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+    num_prefills = seq_lens.shape[0]
+    if num_prefills and max_blocks:
+        _dqc_context_kernel[(num_prefills, max_blocks, PAGES_PER_SPARSE_BLOCK)](
+            block_table,
+            block_table.stride(0),
+            seq_lens,
+            blk_start,
+            slot_of,
+            k_u8.view(torch.int32),
+            v_u8.view(torch.int32),
+            k_u8,
+            _nvfp4_lut(dev),
+            k8,
+            v8,
+            page // 4,
+            BLOCK_PAGE_STRIDE=stride,
+            PAGES_PER_BLOCK=PAGES_PER_SPARSE_BLOCK,
+            num_warps=2,
+        )
+    rows, cols = sparse_bt.shape
+    new_bt = torch.empty((rows, cols), dtype=torch.int32, device=dev)
+    BLOCK = 256
+    if rows:
+        _dqc_remap_kernel[(rows, triton.cdiv(cols, BLOCK))](
+            sparse_bt,
+            sparse_bt.stride(0),
+            sparse_ctx,
+            new_bt,
+            new_bt.stride(0),
+            slot_of,
+            cols,
+            BLOCK=BLOCK,
+            num_warps=4,
+        )
+    fp8 = k_cache.dtype
+    return k8.view(fp8), v8.view(fp8), new_bt
+
+
 @torch.no_grad()
 def minimax_m3_sparse_attn_prefill_aiter(
     q: torch.Tensor,  # [total_q, num_heads, head_dim]
@@ -673,6 +868,9 @@ def minimax_m3_sparse_attn_prefill_aiter(
     v_scale: torch.Tensor | None = None,
     sparse_bt: torch.Tensor | None = None,
     sparse_ctx: torch.Tensor | None = None,
+    seq_lens: torch.Tensor | None = None,
+    max_seq_len: int | None = None,
+    total_kv_blocks: int | None = None,
 ) -> None:
     if (sparse_bt is None) != (sparse_ctx is None):
         raise ValueError(
@@ -688,6 +886,40 @@ def minimax_m3_sparse_attn_prefill_aiter(
             minimax_m3_sparse_block_page_stride(k_cache, v_cache),
         )
     assert sparse_ctx is not None
+    if (
+        seq_lens is not None
+        and max_seq_len is not None
+        and total_kv_blocks is not None
+        and _is_fp8_kv_cache_tensor(k_cache)
+        and minimax_m3_sparse_kv_nvfp4()
+        and minimax_m3_sparse_kv_prefill_dq()
+        and all(s is None or s.numel() == 1 for s in (k_scale, v_scale))
+    ):
+        k_ws, v_ws, ws_bt = minimax_m3_sparse_kv_dequant_context(
+            k_cache,
+            v_cache,
+            block_table,
+            seq_lens,
+            max_seq_len,
+            total_kv_blocks,
+            sparse_bt,
+            sparse_ctx,
+        )
+        one = torch.ones(1, dtype=torch.float32, device=q.device)
+        _run_gluon_decode(
+            q,
+            k_ws,
+            v_ws,
+            ws_bt,
+            sparse_ctx,
+            num_kv_heads,
+            sm_scale,
+            output,
+            one if k_scale is None else k_scale,
+            one if v_scale is None else v_scale,
+            nvfp4=False,
+        )
+        return
     _run_gluon_decode(
         q,
         k_cache,
@@ -713,6 +945,7 @@ def _run_gluon_decode(
     output: torch.Tensor,
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
+    nvfp4: bool | None = None,
 ) -> None:
     from aiter import dtypes as aiter_dtypes
     from aiter.ops.triton.gluon.pa_decode_gluon import (
@@ -771,7 +1004,9 @@ def _run_gluon_decode(
 
     # Only passed when set: stock AITER has no kv_block_scale argument.
     nvfp4_kwargs: dict[str, torch.Tensor] = {}
-    if is_fp8 and minimax_m3_sparse_kv_nvfp4():
+    if nvfp4 is None:
+        nvfp4 = minimax_m3_sparse_kv_nvfp4()
+    if is_fp8 and nvfp4:
         if hkv != 1:
             raise ValueError("MiniMax-M3 NVFP4 sparse KV needs one KV head")
         k_cache_view, v_cache_view, nvfp4_kwargs["kv_block_scale"] = (

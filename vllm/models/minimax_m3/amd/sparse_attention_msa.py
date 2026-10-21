@@ -243,5 +243,8 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
                     if sparse_ctx_buf is None
                     else sparse_ctx_buf[nd * kvh : num_tokens * kvh]
                 ),
+                seq_lens=p.seq_lens,
+                max_seq_len=p.max_seq_len,
+                total_kv_blocks=p.total_kv_blocks,
             )
         return output

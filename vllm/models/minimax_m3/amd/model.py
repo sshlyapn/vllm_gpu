@@ -17,6 +17,7 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
+import copy
 from collections.abc import Iterable
 
 import torch
@@ -91,6 +92,10 @@ from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
 from vllm.models.minimax_m3.amd.indexer_aiter import (
     MiniMaxM3AiterIndexer,
     select_aiter_indexer_impl_cls,
+)
+from vllm.models.minimax_m3.amd.nvfp4_moe import (
+    MiniMaxM3NvFp4MoEMethod,
+    hf_moe_quant_algo,
 )
 from vllm.models.minimax_m3.amd.ops import (
     gemma_fused_add_rmsnorm,
@@ -406,6 +411,23 @@ class MiniMaxM3MoE(nn.Module):
         # This should be cleaned up and use `resolve_layer_fused_shared_expert`.
         fse_requested = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
 
+        # MiniMax-M3.1: NVFP4 routed experts inside an MXFP8 checkpoint. The
+        # shared expert stays MXFP8, so it cannot be fused into the routed call.
+        experts_quant_config = quant_config
+        self.nvfp4_experts = (
+            hf_moe_quant_algo(get_current_vllm_config().model_config)
+            == "NVFP4"
+        )
+        if self.nvfp4_experts:
+            if not hasattr(quant_config, "FusedMoEMethodCls"):
+                raise ValueError(
+                    "MiniMax-M3 NVFP4 experts need the ModelOpt MXFP8 config, got "
+                    f"{type(quant_config).__name__}"
+                )
+            experts_quant_config = copy.copy(quant_config)
+            experts_quant_config.FusedMoEMethodCls = MiniMaxM3NvFp4MoEMethod
+            fse_requested = False
+
         self.is_fused_shared_expert_enabled = False
         if (
             fse_requested
@@ -479,7 +501,7 @@ class MiniMaxM3MoE(nn.Module):
             ),
             fuse_shared_experts=self.is_fused_shared_expert_enabled,
             shared_expert_prefix=f"{prefix}.shared_experts",
-            quant_config=quant_config,
+            quant_config=experts_quant_config,
             prefix=f"{prefix}.experts",
         )
 
