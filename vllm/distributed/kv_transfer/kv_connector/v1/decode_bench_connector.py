@@ -296,7 +296,9 @@ class _M3Pools:
     NUM_LOSERS = 32
     NUM_KV = 64
 
-    def __init__(self, seed: int, num_winners: int, idx_fmt: str, kv_fmt: str):
+    def __init__(
+        self, seed: int, num_winners: int, idx_fmt: str, kv_fmt: str | None
+    ):
         self.seed = seed
         self.num_winners = num_winners
         self.idx_fmt = idx_fmt
@@ -343,6 +345,13 @@ class _M3Pools:
                     enc = enc_idx_nvfp4 if self.idx_fmt == "nvfp4" else enc_idx_fp8
                     pool = enc(*spec)
             else:
+                if self.kv_fmt is None:
+                    from vllm.models.minimax_m3.amd.ops.sparse_pa import (
+                        minimax_m3_sparse_kv_nvfp4,
+                    )
+
+                    nvfp4 = minimax_m3_sparse_kv_nvfp4()
+                    self.kv_fmt = "nvfp4" if nvfp4 else "fp8"
                 k, v = self.kv_specs(kind[1], kind[2])
                 if compact:
                     assert self.kv_fmt == "nvfp4", "compact KV needs nvfp4"
@@ -795,7 +804,8 @@ class DecodeBenchConnectorWorker:
                 os.environ.get("AITER_MSA_INDEX_KV_FMT", "fp8").strip().lower()
                 or "fp8"
             )
-            kv_fmt = os.environ.get("MINIMAX_M3_SPARSE_KV_FMT", "fp8").lower()
+            # None: the model's default, resolved at the first fill.
+            kv_fmt = os.environ.get("MINIMAX_M3_SPARSE_KV_FMT", "").lower() or None
             self._m3_pools = _M3Pools(
                 seed=int(kv_transfer_config.get_from_extra_config("fill_seed", 1234)),
                 num_winners=int(
@@ -807,7 +817,7 @@ class DecodeBenchConnectorWorker:
             logger.info(
                 "DecodeBenchConnector m3_pool: idx_fmt=%s kv_fmt=%s winners=%d",
                 idx_fmt,
-                kv_fmt,
+                kv_fmt or "model default",
                 self._m3_pools.num_winners,
             )
             if self._m3_dump_dir:

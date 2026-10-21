@@ -107,8 +107,9 @@ from vllm.models.minimax_m3.amd.ops.sparse_pa import (
     minimax_m3_alloc_sparse_block_table,
     minimax_m3_compact_kv_views,
     minimax_m3_sparse_block_page_stride,
+    minimax_m3_resolve_sparse_kv_nvfp4,
     minimax_m3_sparse_kv_compact,
-    minimax_m3_sparse_kv_nvfp4,
+    minimax_m3_sparse_kv_fmt_requested,
 )
 from vllm.models.minimax_m3.amd.sparse_attention_msa import (
     MiniMaxM3SparseAiterPADecodeMetadata,
@@ -860,15 +861,16 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             )
         # Same for the sparse layers' main K/V: only the AITER sparse PA insert
         # writes nvfp4 into the fp8 pages, and only its attend reads them.
-        self.sparse_kv_nvfp4 = minimax_m3_sparse_kv_nvfp4()
-        if self.sparse_kv_nvfp4 and not (
-            self.use_aiter_sparse_pa and is_quantized_kv_cache(self.kv_cache_dtype)
-        ):
+        nvfp4_ok = self.use_aiter_sparse_pa and is_quantized_kv_cache(
+            self.kv_cache_dtype
+        )
+        if minimax_m3_sparse_kv_fmt_requested() == "nvfp4" and not nvfp4_ok:
             raise ValueError(
                 "MINIMAX_M3_SPARSE_KV_FMT=nvfp4 needs the AITER sparse PA path "
                 "and an fp8 KV cache; unset it for this config "
                 f"(layer {self.layer_name})"
             )
+        self.sparse_kv_nvfp4 = minimax_m3_resolve_sparse_kv_nvfp4(nvfp4_ok)
         self.sparse_kv_compact = minimax_m3_sparse_kv_compact()
         if self.sparse_kv_compact and (
             self.num_kv_heads != 1 or self.head_dim != 128

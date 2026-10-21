@@ -35,32 +35,57 @@ def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
 
 
 @cache
+def minimax_m3_sparse_kv_fmt_requested() -> str | None:
+    """MINIMAX_M3_SPARSE_KV_FMT (fp8 | nvfp4), or None when unset."""
+    fmt = os.environ.get("MINIMAX_M3_SPARSE_KV_FMT", "").strip().lower()
+    if fmt not in ("", "fp8", "nvfp4"):
+        raise ValueError(f"MINIMAX_M3_SPARSE_KV_FMT must be fp8 or nvfp4, got {fmt}")
+    return fmt or None
+
+
+# Set by the sparse layers at init (minimax_m3_resolve_sparse_kv_nvfp4).
+_sparse_kv_nvfp4: bool | None = None
+
+
+def minimax_m3_resolve_sparse_kv_nvfp4(supported: bool) -> bool:
+    """Pick the sparse layers' KV format: MINIMAX_M3_SPARSE_KV_FMT if set,
+    else nvfp4 when the layer supports it (AITER sparse PA, fp8 KV cache)."""
+    global _sparse_kv_nvfp4
+    fmt = minimax_m3_sparse_kv_fmt_requested()
+    nvfp4 = supported if fmt is None else fmt == "nvfp4"
+    if _sparse_kv_nvfp4 is not None and _sparse_kv_nvfp4 != nvfp4:
+        raise ValueError("MiniMax-M3 sparse layers disagree on the KV format")
+    _sparse_kv_nvfp4 = nvfp4
+    return nvfp4
+
+
 def minimax_m3_sparse_kv_nvfp4() -> bool:
-    """Experimental MINIMAX_M3_SPARSE_KV_FMT=nvfp4 for the sparse layers.
+    """NVFP4 KV for the sparse layers (default where supported).
 
     The fp8 KV cache keeps its shape and size. The first 1024 B of each
     2048 B (page, head) chunk of the K side hold the NVFP4 K codes and the
     next 256 B the K and V scales; the first 1024 B of the V side chunk hold
     the NVFP4 V codes. That is the layout pa_decode_gluon reads with
     kv_block_scale, and only those 2304 of 4096 B per page are touched.
+    Before any layer resolved it, only an explicit nvfp4 counts.
     """
-    fmt = os.environ.get("MINIMAX_M3_SPARSE_KV_FMT", "fp8").lower()
-    if fmt not in ("fp8", "nvfp4"):
-        raise ValueError(f"MINIMAX_M3_SPARSE_KV_FMT must be fp8 or nvfp4, got {fmt}")
-    return fmt == "nvfp4"
+    if _sparse_kv_nvfp4 is None:
+        return minimax_m3_sparse_kv_fmt_requested() == "nvfp4"
+    return _sparse_kv_nvfp4
 
 
 @cache
+def _compact_pages_requested() -> bool:
+    return os.environ.get("MINIMAX_M3_NVFP4_COMPACT_PAGES", "0") == "1"
+
+
 def minimax_m3_sparse_kv_compact() -> bool:
     """MINIMAX_M3_NVFP4_COMPACT_PAGES=1 (NVFP4 sparse KV only): allocate real
     NVFP4 pages instead of fp8 ones. A 128-token block is 8 pages of 2304 B,
     [K codes 1024 | K/V scales 256 | V codes 1024], so K and V of a page share
     its page id with no page-16 rebase (see NVFP4_COMPACT_PAGE_BYTES).
     """
-    return (
-        minimax_m3_sparse_kv_nvfp4()
-        and os.environ.get("MINIMAX_M3_NVFP4_COMPACT_PAGES", "0") == "1"
-    )
+    return minimax_m3_sparse_kv_nvfp4() and _compact_pages_requested()
 
 
 # Per (page, head) chunk: [head_size // 16, 16 tokens, 8 B] codes, then on the
