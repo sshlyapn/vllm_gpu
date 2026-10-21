@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MSA AITER block-sparse attend for MiniMax M3."""
 
+import os
+from collections import Counter
 from dataclasses import dataclass
 
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.models.minimax_m3.common.sparse_attention import (
     MiniMaxM3SparseBackend,
     MiniMaxM3SparseDecodeMetadata,
@@ -23,6 +26,24 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+logger = init_logger(__name__)
+
+# Debug: histogram of (prefill rows, dqC groups) per metadata build, logged
+# every _DQC_LOG_EVERY prefill builds.
+_DQC_LOG_GROUPS = os.environ.get("MINIMAX_M3_DQC_LOG_GROUPS", "0") == "1"
+_DQC_LOG_EVERY = 10
+_dqc_group_hist: Counter[tuple[int, int]] = Counter()
+
+
+def _log_dqc_groups(rows: int, groups: int) -> None:
+    _dqc_group_hist[(rows, groups)] += 1
+    total = sum(_dqc_group_hist.values())
+    if total % _DQC_LOG_EVERY == 0:
+        hist = " ".join(
+            f"{r}r{g}g:{c}" for (r, g), c in sorted(_dqc_group_hist.items())
+        )
+        logger.info("MiniMax-M3 dqC groups after %d prefill builds: %s", total, hist)
+
 
 class MiniMaxM3SparseAiterPABackend(MiniMaxM3SparseBackend):
     """MiniMax M3 backend carrying the AITER page-16 block-table rebase."""
@@ -37,6 +58,8 @@ class MiniMaxM3SparseAiterPAPrefillMetadata(MiniMaxM3SparsePrefillMetadata):
     # ``block_table`` rebased onto AITER's page-16 numbering; see
     # ``MiniMaxM3SparseAiterPAMetadataBuilder.build``.
     page16_block_table: torch.Tensor | None = None
+    # dqC row groups that fit the reserved workspace; see minimax_m3_dqc_groups.
+    dqc_groups: list[tuple[int, int, int, int, int]] | None = None
 
 
 @dataclass
@@ -62,6 +85,10 @@ class MiniMaxM3SparseAiterPAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
         vllm_config: VllmConfig,
         device: torch.device,
     ) -> None:
+        from vllm.models.minimax_m3.amd.ops.sparse_pa import (
+            minimax_m3_dqc_budget_blocks,
+        )
+
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         # Stable address for the same reason as the base's own buffers: a
         # captured decode replay writes through the address it captured.
@@ -73,6 +100,9 @@ class MiniMaxM3SparseAiterPAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
             dtype=torch.int32,
             device=device,
         )
+        self.dqc_budget_blocks = minimax_m3_dqc_budget_blocks(
+            vllm_config.model_config.max_model_len
+        )
 
     def build(
         self,
@@ -81,6 +111,8 @@ class MiniMaxM3SparseAiterPAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
         fast_build: bool = False,
     ) -> MiniMaxM3SparseMetadata:
         from vllm.models.minimax_m3.amd.ops.sparse_pa import (
+            minimax_m3_dqc_enabled,
+            minimax_m3_dqc_groups,
             minimax_m3_rebase_block_table_to_page16,
         )
 
@@ -109,15 +141,63 @@ class MiniMaxM3SparseAiterPAMetadataBuilder(MiniMaxM3SparseMetadataBuilder):
                 page16_block_table=page16[:nd],
             )
         if metadata.prefill is not None:
+            dqc_groups = None
+            if minimax_m3_dqc_enabled():
+                n = common_attn_metadata.num_reqs
+                seq_ub = common_attn_metadata.seq_lens_cpu_upper_bound
+                assert seq_ub is not None
+                qsl = common_attn_metadata.query_start_loc_cpu[nd : n + 1]
+                dqc_groups = minimax_m3_dqc_groups(
+                    seq_ub[nd:n].tolist(),
+                    (qsl - qsl[0]).tolist(),
+                    self.dqc_budget_blocks,
+                )
+                if _DQC_LOG_GROUPS:
+                    _log_dqc_groups(n - nd, len(dqc_groups))
             metadata.prefill = MiniMaxM3SparseAiterPAPrefillMetadata(
                 **vars(metadata.prefill),
                 page16_block_table=page16[nd:],
+                dqc_groups=dqc_groups,
             )
         return metadata
 
 
 class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
     """ROCm AITER page-16 SHUFFLE sparse paged attention."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        from vllm.models.minimax_m3.amd.ops.sparse_pa import (
+            PAGES_PER_SPARSE_BLOCK,
+            minimax_m3_dqc_budget_blocks,
+            minimax_m3_dqc_enabled,
+        )
+
+        super().__init__(*args, **kwargs)
+        # The dqC fp8 workspace is taken from vLLM's workspace manager at its
+        # full size on the first forward (the memory profiling run), so it is
+        # counted before the KV cache is sized and never grows after lock.
+        self.dqc_ws_pages = 0
+        if minimax_m3_dqc_enabled():
+            max_model_len = get_current_vllm_config().model_config.max_model_len
+            self.dqc_ws_pages = (
+                minimax_m3_dqc_budget_blocks(max_model_len) * PAGES_PER_SPARSE_BLOCK
+            )
+        self._dqc_reserved = False
+
+    def _reserve_dqc_workspace(self) -> None:
+        from vllm.models.minimax_m3.amd.ops.sparse_pa import (
+            minimax_m3_dqc_reserve_rows,
+            minimax_m3_dqc_workspace,
+        )
+
+        k8, v8 = minimax_m3_dqc_workspace(self.dqc_ws_pages)
+        self._dqc_reserved = True
+        logger.info_once(
+            "MiniMax-M3 dqC: reserved %.1f MiB of workspace (%d rows x "
+            "max_model_len)",
+            (k8.numel() + v8.numel()) / 2**20,
+            minimax_m3_dqc_reserve_rows(),
+        )
 
     def forward(
         self,
@@ -137,6 +217,8 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
             minimax_m3_sparse_block_page_stride,
         )
 
+        if self.dqc_ws_pages and not self._dqc_reserved:
+            self._reserve_dqc_workspace()
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
             return output
@@ -246,5 +328,7 @@ class MiniMaxM3SparseAiterPAImpl(MiniMaxM3SparseImpl):
                 seq_lens=p.seq_lens,
                 max_seq_len=p.max_seq_len,
                 total_kv_blocks=p.total_kv_blocks,
+                dqc_groups=p.dqc_groups,
+                dqc_ws_pages=self.dqc_ws_pages or None,
             )
         return output

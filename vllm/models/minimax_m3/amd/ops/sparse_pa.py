@@ -723,6 +723,82 @@ def minimax_m3_sparse_kv_prefill_dq() -> bool:
     return os.environ.get("MINIMAX_M3_SPARSE_KV_PREFILL_DQ", "1") == "1"
 
 
+def minimax_m3_dqc_enabled() -> bool:
+    return minimax_m3_sparse_kv_nvfp4() and minimax_m3_sparse_kv_prefill_dq()
+
+
+@cache
+def minimax_m3_dqc_reserve_rows() -> int:
+    """MINIMAX_M3_DQC_RESERVE_ROWS (default 4): the dqC fp8 workspace is
+    reserved during memory profiling for this many max_model_len contexts;
+    prefill rows are dequantized and attended in groups that fit it.
+    """
+    rows = int(os.environ.get("MINIMAX_M3_DQC_RESERVE_ROWS", "4"))
+    if rows < 1:
+        raise ValueError(f"MINIMAX_M3_DQC_RESERVE_ROWS must be >= 1, got {rows}")
+    return rows
+
+
+def minimax_m3_dqc_budget_blocks(max_model_len: int) -> int:
+    """Workspace capacity in 128-token blocks. One spare block per row covers
+    seq_lens_cpu_upper_bound running past max_model_len."""
+    return minimax_m3_dqc_reserve_rows() * (
+        triton.cdiv(max_model_len, SPARSE_BLOCK_SIZE) + 1
+    )
+
+
+def minimax_m3_dqc_groups(
+    seq_lens_cpu: list[int], query_start_cpu: list[int], budget_blocks: int
+) -> list[tuple[int, int, int, int, int]]:
+    """Greedy consecutive grouping of prefill rows under ``budget_blocks``.
+
+    query_start_cpu: prefill-relative cumulative query lengths (len rows + 1).
+    Returns (row_start, row_end, q_start, q_end, kv_blocks) per group.
+    """
+    groups = []
+    r0 = 0
+    blocks = 0
+    for r, s in enumerate(seq_lens_cpu):
+        nb = (s + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE
+        if nb > budget_blocks:
+            raise ValueError(
+                f"MiniMax-M3 dqC: a {s}-token prefill row needs {nb} blocks, "
+                f"the workspace holds {budget_blocks}"
+            )
+        if blocks + nb > budget_blocks:
+            groups.append((r0, r, query_start_cpu[r0], query_start_cpu[r], blocks))
+            r0, blocks = r, 0
+        blocks += nb
+    n = len(seq_lens_cpu)
+    if n > r0:
+        groups.append((r0, n, query_start_cpu[r0], query_start_cpu[n], blocks))
+    return groups
+
+
+def minimax_m3_dqc_workspace(ws_pages: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """uint8 K [ws_pages, 1, 8, 16, 16] / V [ws_pages, 1, 1, 128, 16] views of
+    vLLM's workspace (sized by the profiling run, fixed after lock)."""
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        is_workspace_manager_initialized,
+    )
+
+    shapes = (
+        ((ws_pages, 1, 8, 16, 16), torch.uint8),
+        ((ws_pages, 1, 1, 128, 16), torch.uint8),
+    )
+    if is_workspace_manager_initialized():
+        k8, v8 = current_workspace_manager().get_simultaneous(*shapes)
+        return k8, v8
+    # Standalone op tests: grow-only module buffers.
+    key = ("ws", torch.cuda.current_device())
+    st = _DQC_STATE.get(key)
+    if st is None or st[0].shape[0] < ws_pages:
+        st = tuple(torch.empty(s, dtype=d, device="cuda") for s, d in shapes)
+        _DQC_STATE[key] = st
+    return st[0][:ws_pages], st[1][:ws_pages]
+
+
 @triton.jit
 def _dqc_page(src, dst, kw, vw, ksc, lut, k8, v8, page_w):
     """Dequantize NVFP4 page ``src`` (K and V) into fp8 workspace page ``dst``.
@@ -825,20 +901,15 @@ def _nvfp4_lut(device: torch.device) -> torch.Tensor:
     return _DQC_STATE[key]
 
 
-def _dqc_buffers(device, num_pages: int, ws_pages: int):
-    key = ("buf", device)
-    st = _DQC_STATE.get(key)
-    if st is None or st[0].numel() < num_pages or st[1].shape[0] < ws_pages:
-        if st is not None:
-            ws_pages = max(ws_pages, st[1].shape[0])
-            num_pages = max(num_pages, st[0].numel())
-        ws_pages = max(ws_pages, 1024)
+def _dqc_slot_of(device, num_pages: int) -> torch.Tensor:
+    # int32 per physical KV page (KV pool pages * 4 B), outside the workspace:
+    # its size is only known once the KV cache exists.
+    key = ("slot_of", device)
+    slot_of = _DQC_STATE.get(key)
+    if slot_of is None or slot_of.numel() < num_pages:
         slot_of = torch.zeros(num_pages, dtype=torch.int32, device=device)
-        k8 = torch.empty(ws_pages, 1, 8, 16, 16, dtype=torch.uint8, device=device)
-        v8 = torch.empty(ws_pages, 1, 1, 128, 16, dtype=torch.uint8, device=device)
-        st = (slot_of, k8, v8)
-        _DQC_STATE[key] = st
-    return st
+        _DQC_STATE[key] = slot_of
+    return slot_of
 
 
 def minimax_m3_sparse_kv_dequant_context(
@@ -850,9 +921,12 @@ def minimax_m3_sparse_kv_dequant_context(
     total_kv_blocks: int,
     sparse_bt: torch.Tensor,
     sparse_ctx: torch.Tensor,
+    workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """dqC: NVFP4 context pages -> fp8 workspace pages + remapped page table.
 
+    workspace: uint8 K / V page buffers with >= total_kv_blocks * 8 pages
+    (default: minimax_m3_dqc_workspace of exactly that size).
     Returns (fp8 K workspace, fp8 V workspace, page table in workspace ids).
     """
     nphys16, hkv = k_cache.shape[0], k_cache.shape[1]
@@ -867,7 +941,15 @@ def minimax_m3_sparse_kv_dequant_context(
     stride = minimax_m3_sparse_block_page_stride(k_cache, v_cache)
     dev = k_cache.device
     ws_pages = total_kv_blocks * PAGES_PER_SPARSE_BLOCK
-    slot_of, k8, v8 = _dqc_buffers(dev, nphys16, ws_pages)
+    if workspace is None:
+        workspace = minimax_m3_dqc_workspace(ws_pages)
+    k8, v8 = workspace
+    if k8.shape[0] < ws_pages or v8.shape[0] < ws_pages:
+        raise ValueError(
+            f"MiniMax-M3 dqC workspace holds {k8.shape[0]} pages, "
+            f"{ws_pages} needed"
+        )
+    slot_of = _dqc_slot_of(dev, nphys16)
     nblk = (seq_lens + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE
     blk_start = (torch.cumsum(nblk, 0) - nblk).to(torch.int32)
     max_blocks = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
@@ -928,7 +1010,12 @@ def minimax_m3_sparse_attn_prefill_aiter(
     seq_lens: torch.Tensor | None = None,
     max_seq_len: int | None = None,
     total_kv_blocks: int | None = None,
+    dqc_groups: list[tuple[int, int, int, int, int]] | None = None,
+    dqc_ws_pages: int | None = None,
 ) -> None:
+    """dqc_groups (from minimax_m3_dqc_groups): prefill rows are dequantized
+    and attended group by group in one fixed workspace of dqc_ws_pages pages.
+    None: one group of total_kv_blocks."""
     if (sparse_bt is None) != (sparse_ctx is None):
         raise ValueError(
             "MiniMax-M3 prepared sparse block table and context lengths "
@@ -952,30 +1039,47 @@ def minimax_m3_sparse_attn_prefill_aiter(
         and minimax_m3_sparse_kv_prefill_dq()
         and all(s is None or s.numel() == 1 for s in (k_scale, v_scale))
     ):
-        k_ws, v_ws, ws_bt = minimax_m3_sparse_kv_dequant_context(
-            k_cache,
-            v_cache,
-            block_table,
-            seq_lens,
-            max_seq_len,
-            total_kv_blocks,
-            sparse_bt,
-            sparse_ctx,
-        )
+        total_q = q.shape[0]
+        if dqc_groups is None:
+            dqc_groups = [(0, seq_lens.shape[0], 0, total_q, total_kv_blocks)]
+        if dqc_ws_pages is None:
+            dqc_ws_pages = max(g[4] for g in dqc_groups) * PAGES_PER_SPARSE_BLOCK
+        # Requested at the same size every call: the profiled reservation
+        # never grows.
+        workspace = minimax_m3_dqc_workspace(dqc_ws_pages)
         one = torch.ones(1, dtype=torch.float32, device=q.device)
-        _run_gluon_decode(
-            q,
-            k_ws,
-            v_ws,
-            ws_bt,
-            sparse_ctx,
-            num_kv_heads,
-            sm_scale,
-            output,
-            one if k_scale is None else k_scale,
-            one if v_scale is None else v_scale,
-            nvfp4=False,
-        )
+        kvh = num_kv_heads
+        for r0, r1, q0, q1, blocks in dqc_groups:
+            if q1 == q0:
+                continue
+            g_ctx = sparse_ctx[q0 * kvh : q1 * kvh]
+            k_ws, v_ws, ws_bt = minimax_m3_sparse_kv_dequant_context(
+                k_cache,
+                v_cache,
+                block_table[r0:r1],
+                seq_lens[r0:r1],
+                max_seq_len,
+                blocks,
+                sparse_bt[q0 * kvh : q1 * kvh],
+                g_ctx,
+                workspace,
+            )
+            # Split count from the whole prefill batch keeps grouped results
+            # bit-identical to one group.
+            _run_gluon_decode(
+                q[q0:q1],
+                k_ws,
+                v_ws,
+                ws_bt,
+                g_ctx,
+                num_kv_heads,
+                sm_scale,
+                output[q0:q1],
+                one if k_scale is None else k_scale,
+                one if v_scale is None else v_scale,
+                nvfp4=False,
+                split_num_seqs=total_q * kvh,
+            )
         return
     _run_gluon_decode(
         q,
@@ -1003,6 +1107,7 @@ def _run_gluon_decode(
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
     nvfp4: bool | None = None,
+    split_num_seqs: int | None = None,
 ) -> None:
     from aiter import dtypes as aiter_dtypes
     from aiter.ops.triton.gluon.pa_decode_gluon import (
@@ -1030,7 +1135,9 @@ def _run_gluon_decode(
     out_view = output.view(total_q * num_kv_heads, group_size, head_size)
 
     num_seqs = total_q * num_kv_heads
-    max_context_partition_num = get_recommended_splits(num_seqs, 1)
+    max_context_partition_num = get_recommended_splits(
+        num_seqs if split_num_seqs is None else split_num_seqs, 1
+    )
     context_partition_size = 256
     intermediate_shape = (num_seqs, 1, max_context_partition_num, group_size)
     exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
