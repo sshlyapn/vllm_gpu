@@ -11,16 +11,20 @@ weight_global_scale) and ``input_global_scale`` (unused, activations stay
 dynamic).
 
 Loading: custom weight loaders slice the TP shard (w1/w3 rows, w2 columns)
-into ``w13_*`` / ``w2_*`` NVFP4 parameters.
+into ``w13_*`` / ``w2_*`` NVFP4 parameters. After loading, up to three
+execution paths are prepared; per call the first that applies is used:
 
-After loading, the NVFP4 weights are always re-quantized to MXFP8 (E8M0 per
-32, the per-expert global multiplier folded in) and handed to the stock
-ModelOpt MXFP8 MoE path (AITER MXFP8 MoE kernels). That is the reference
-fallback and the prefill path ("xdeca-folded").
+  1. HIP NVFP4 decode kernels (VLLM_M3_NVFP4_MOE_HIP=1) for
+     T <= VLLM_M3_NVFP4_MOE_HIP_MAX_T (default 1024, max 1024).
+  2. NVFP4 FlyDSL MoE (VLLM_M3_NVFP4_MOE_PREFILL=nv): nv2 for
+     NV_MIN_T < T <= NV2_MAX_T, VLLM_M3_NVFP4_MOE_NV_LARGE (nv8w | xdeca |
+     baseline) above. See ops/nvfp4_moe_pf.py.
+  3. Baseline copy: the exact NVFP4 weight (global scale included) re-quantized
+     to VLLM_M3_NVFP4_MOE_BASELINE_FMT (mxfp8 | ptpc_fp8 | mxfp4), all on the
+     AITER MoE path (aiter.fused_moe). See ops/moe_baselines.py.
 
-VLLM_M3_NVFP4_MOE_HIP=1 additionally keeps the NVFP4 weights in the HIP F16
-decode-kernel layout and runs batches with T <= VLLM_M3_NVFP4_MOE_HIP_MAX_T
-(default 1024, max 1024) on them.
+The baseline copy is built if any call can reach it, or always with
+VLLM_M3_NVFP4_MOE_KEEP_MXFP8=1 (default).
 """
 
 import functools
@@ -37,6 +41,18 @@ logger = init_logger(__name__)
 
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
          -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)  # fmt: skip
+_BASELINE_ALIASES = ("baseline", "mxfp8")
+
+
+def _env(name: str, default: str) -> str:
+    return os.environ.get(name, default).strip().lower()
+
+
+def _env_choice(name: str, default: str, choices) -> str:
+    v = _env(name, default)
+    if v not in choices:
+        raise ValueError(f"{name}={v!r}: expected one of {choices}")
+    return v
 
 
 def nvfp4_moe_hip_enabled() -> bool:
@@ -45,6 +61,24 @@ def nvfp4_moe_hip_enabled() -> bool:
 
 def nvfp4_moe_hip_max_t() -> int:
     return min(int(os.environ.get("VLLM_M3_NVFP4_MOE_HIP_MAX_T", "1024")), 1024)
+
+
+def nvfp4_moe_baseline_fmt() -> str:
+    return _env_choice(
+        "VLLM_M3_NVFP4_MOE_BASELINE_FMT", "mxfp8", ("mxfp8", "ptpc_fp8", "mxfp4")
+    )
+
+
+def nvfp4_moe_prefill() -> str:
+    v = _env_choice("VLLM_M3_NVFP4_MOE_PREFILL", "mxfp8", _BASELINE_ALIASES + ("nv",))
+    return "nv" if v == "nv" else "baseline"
+
+
+def nvfp4_moe_nv_large() -> str:
+    v = _env_choice(
+        "VLLM_M3_NVFP4_MOE_NV_LARGE", "nv8w", ("nv8w", "xdeca") + _BASELINE_ALIASES
+    )
+    return "baseline" if v in _BASELINE_ALIASES else v
 
 
 def _qc_moe_quant_algo(qc) -> str | None:
@@ -115,26 +149,113 @@ def requant_mxfp8(v):
     return q, (ex + 127).to(torch.uint8)
 
 
+def requant_baseline(fmt, w13p, w13s, w2p, w2s, g13, g2, step=8):
+    """Exact NVFP4 (incl. 1 / global) -> fmt, raw (unshuffled) tensors."""
+    from vllm.models.minimax_m3.amd.ops import moe_baselines as mb
+
+    E, N13, H2 = w13p.shape
+    I, H = N13 // 2, H2 * 2
+    dev = w13p.device
+    fp8 = torch.float8_e4m3fn
+    if fmt == "mxfp8":
+        q = (fp8, fp8, torch.uint8, torch.uint8)
+        shp = ((E, N13, H), (E, H, I), (E, N13, H // 32), (E, H, I // 32))
+        fn = requant_mxfp8
+    elif fmt == "ptpc_fp8":
+        q = (fp8, fp8, torch.float32, torch.float32)
+        shp = ((E, N13, H), (E, H, I), (E, N13, 1), (E, H, 1))
+        fn = mb.requant_ptpc_fp8
+    else:
+        q = (torch.uint8,) * 4
+        shp = ((E, N13, H // 2), (E, H, I // 2), (E, N13, H // 32), (E, H, I // 32))
+        fn = functools.partial(mb.requant_mxfp4, mode=mb.mxfp4_scale_mode())
+    w13, w2, s13, s2 = (torch.empty(s, dtype=d, device=dev) for s, d in zip(shp, q))
+    rows13 = g13.repeat_interleave(I, dim=1)  # [E, 2I]
+    for e0 in range(0, E, step):
+        e1 = min(E, e0 + step)
+        v = dequant_nvfp4(w13p[e0:e1], w13s[e0:e1], rows13[e0:e1])
+        w13[e0:e1], s13[e0:e1] = fn(v)
+        gm = g2[e0:e1, None].expand(e1 - e0, H)
+        v = dequant_nvfp4(w2p[e0:e1], w2s[e0:e1], gm)
+        w2[e0:e1], s2[e0:e1] = fn(v)
+        del v
+    return w13, s13, w2, s2
+
+
 def _param(data: torch.Tensor, loader) -> nn.Parameter:
     p = nn.Parameter(data, requires_grad=False)
     set_weight_attrs(p, {"weight_loader": loader})
     return p
 
 
+def _max_num_batched_tokens() -> int | None:
+    from vllm.config import get_current_vllm_config_or_none
+
+    cfg = get_current_vllm_config_or_none()
+    sched = getattr(cfg, "scheduler_config", None)
+    return getattr(sched, "max_num_batched_tokens", None)
+
+
+_NVFP4_PARAMS = (
+    "w13_weight_packed",
+    "w13_weight_scale",
+    "w13_weight_global_scale",
+    "w13_input_global_scale",
+    "w2_weight_packed",
+    "w2_weight_scale",
+    "w2_weight_global_scale",
+    "w2_input_global_scale",
+)
+
+
 class MiniMaxM3NvFp4MoEMethod(ModelOptMxFp8FusedMoE):
-    """NVFP4 checkpoint experts; MXFP8 (AITER) execution plus HIP decode."""
+    """NVFP4 checkpoint experts: HIP decode, NVFP4 FlyDSL MoE and an AITER
+    baseline copy (mxfp8 / ptpc_fp8 / mxfp4)."""
 
     def __init__(self, quant_config, moe_config) -> None:
         super().__init__(quant_config, moe_config)
         self.use_hip = nvfp4_moe_hip_enabled()
         self.hip_max_t = nvfp4_moe_hip_max_t()
+        self.baseline_fmt = nvfp4_moe_baseline_fmt()
+        self.prefill = nvfp4_moe_prefill()
+        self.nv_large = nvfp4_moe_nv_large()
+        self.nv2_max_t = int(os.environ.get("VLLM_M3_NVFP4_MOE_NV2_MAX_T", "14336"))
+        self.nv_min_t = int(os.environ.get("VLLM_M3_NVFP4_MOE_NV_MIN_T", "0"))
+        self.keep_baseline = os.environ.get("VLLM_M3_NVFP4_MOE_KEEP_MXFP8", "1") == "1"
+        self.max_tokens = _max_num_batched_tokens()
         self.hip_weights = None
+        self.nv_weights = None
+        self.base_weights = None  # ptpc_fp8 / mxfp4 BaselineWeights
+        self.has_baseline = False
+        backend = getattr(self.moe, "moe_backend", "auto")
+        if self.baseline_fmt != "mxfp8" and backend not in ("auto", "aiter"):
+            raise ValueError(
+                f"MiniMax-M3 NVFP4 baseline {self.baseline_fmt} runs on the AITER "
+                f"MoE path only; got --moe-backend {backend}"
+            )
 
     @property
     def mk_can_overlap_shared_experts(self) -> bool:
-        # The HIP path bypasses the modular kernel, so the runner must always
-        # own the shared expert.
+        # The HIP / nv / ptpc / mxfp4 paths bypass the modular kernel, so the
+        # runner must always own the shared expert.
         return False
+
+    # ------------------------------------------------------------ planning
+    def _plan(self):
+        """(nv modes to build, whether the baseline copy is needed)."""
+        big = self.max_tokens is None or self.max_tokens > self.nv2_max_t
+        modes = []
+        need_base = self.prefill != "nv"
+        if self.prefill == "nv":
+            modes.append("nv2")
+            if big:
+                if self.nv_large == "baseline":
+                    need_base = True
+                else:
+                    modes.append(self.nv_large)
+            if self.nv_min_t > (self.hip_max_t if self.use_hip else 0):
+                need_base = True
+        return modes, need_base or self.keep_baseline
 
     # -------------------------------------------------------------- loading
     def create_weights(
@@ -217,9 +338,7 @@ class MiniMaxM3NvFp4MoEMethod(ModelOptMxFp8FusedMoE):
         w2p, w2s = layer.w2_weight_packed.data, layer.w2_weight_scale.data
         g13 = 1.0 / layer.w13_weight_global_scale.data.float()  # [E, 2]
         g2 = 1.0 / layer.w2_weight_global_scale.data.float()  # [E]
-        E, N13, H2 = w13p.shape
-        I, H = N13 // 2, H2 * 2
-        dev = w13p.device
+        modes, need_base = self._plan()
 
         if self.use_hip:
             from vllm.models.minimax_m3.amd.ops.nvfp4_moe_dec import (
@@ -228,47 +347,87 @@ class MiniMaxM3NvFp4MoEMethod(ModelOptMxFp8FusedMoE):
 
             self.hip_weights = NvFp4DecodeWeights(w13p, w13s, w2p, w2s, g13, g2)
 
-        w13 = torch.empty(E, N13, H, dtype=torch.float8_e4m3fn, device=dev)
-        s13 = torch.empty(E, N13, H // 32, dtype=torch.uint8, device=dev)
-        w2 = torch.empty(E, H, I, dtype=torch.float8_e4m3fn, device=dev)
-        s2 = torch.empty(E, H, I // 32, dtype=torch.uint8, device=dev)
-        rows13 = g13.repeat_interleave(I, dim=1)  # [E, 2I]
-        step = 8
-        for e0 in range(0, E, step):
-            e1 = min(E, e0 + step)
-            v = dequant_nvfp4(w13p[e0:e1], w13s[e0:e1], rows13[e0:e1])
-            w13[e0:e1], s13[e0:e1] = requant_mxfp8(v)
-            gm = g2[e0:e1, None].expand(e1 - e0, H)
-            v = dequant_nvfp4(w2p[e0:e1], w2s[e0:e1], gm)
-            w2[e0:e1], s2[e0:e1] = requant_mxfp8(v)
-            del v
+        if modes:
+            from vllm.models.minimax_m3.amd.ops.nvfp4_moe_pf import (
+                NvPrefillWeights,
+                install,
+            )
 
-        for name in (
-            "w13_weight_packed",
-            "w13_weight_scale",
-            "w13_weight_global_scale",
-            "w13_input_global_scale",
-            "w2_weight_packed",
-            "w2_weight_scale",
-            "w2_weight_global_scale",
-            "w2_input_global_scale",
-        ):
+            # One fp32 multiplier per expert for gate and up (load-time check).
+            if not bool((g13[:, 0] == g13[:, 1]).all()):
+                raise ValueError(
+                    "MiniMax-M3 NVFP4 prefill (nv) needs w1/w3 global scales "
+                    "equal per expert; use VLLM_M3_NVFP4_MOE_PREFILL=mxfp8"
+                )
+            install()
+            self.nv_weights = NvPrefillWeights(
+                w13p, w13s, w2p, w2s, g13[:, 0].contiguous(), g2, modes
+            )
+
+        base = None
+        if need_base:
+            base = requant_baseline(self.baseline_fmt, w13p, w13s, w2p, w2s, g13, g2)
+
+        for name in _NVFP4_PARAMS:
             delattr(layer, name)
         del w13p, w13s, w2p, w2s
-        for name, t in (
-            ("w13_weight", w13),
-            ("w2_weight", w2),
-            ("w13_weight_scale", s13),
-            ("w2_weight_scale", s2),
-        ):
-            layer.register_parameter(name, nn.Parameter(t, requires_grad=False))
-        super().process_weights_after_loading(layer)
+
+        if base is not None:
+            w13, s13, w2, s2 = base
+            del base
+            # Set before super(): ModelOpt builds its kernel from
+            # get_fused_moe_quant_config(), which checks has_baseline.
+            self.has_baseline = True
+            if self.baseline_fmt == "mxfp8":
+                for name, t in (
+                    ("w13_weight", w13),
+                    ("w2_weight", w2),
+                    ("w13_weight_scale", s13),
+                    ("w2_weight_scale", s2),
+                ):
+                    layer.register_parameter(name, nn.Parameter(t, requires_grad=False))
+                del w13, s13, w2, s2
+                super().process_weights_after_loading(layer)
+            else:
+                from vllm.models.minimax_m3.amd.ops.moe_baselines import (
+                    BaselineWeights,
+                )
+
+                self.base_weights = BaselineWeights(self.baseline_fmt, w13, s13, w2, s2)
+                del w13, s13, w2, s2
+        layer._already_called_process_weights_after_loading = True
+
+        if self.baseline_fmt != "mxfp8" and self.has_baseline:
+            from vllm.models.minimax_m3.amd.ops.moe_baselines import (
+                aiter_backend_line,
+            )
+
+            logger.info_once(aiter_backend_line(self.baseline_fmt))
         logger.info_once(
-            "MiniMax-M3 NVFP4 experts: MXFP8 re-quantized copy for the AITER "
-            "MXFP8 MoE path; HIP NVFP4 decode %s (T <= %d)",
+            "MiniMax-M3 NVFP4 experts: baseline %s copy %s; HIP decode %s "
+            "(T <= %d); prefill %s (nv2 %d < T <= %d, above: %s; built %s); "
+            "max_num_batched_tokens %s",
+            self.baseline_fmt,
+            "built" if self.has_baseline else "not built",
             "on" if self.use_hip else "off",
             self.hip_max_t,
+            self.prefill,
+            self.nv_min_t,
+            self.nv2_max_t,
+            self.nv_large,
+            ",".join(modes) or "-",
+            self.max_tokens,
         )
+
+    def get_fused_moe_quant_config(self, layer):
+        if self.baseline_fmt == "mxfp8" and self.has_baseline:
+            return super().get_fused_moe_quant_config(layer)
+        from vllm.model_executor.layers.fused_moe.config import (
+            FUSED_MOE_UNQUANTIZED_CONFIG,
+        )
+
+        # Placeholder: these paths call aiter / HIP directly (no modular kernel).
+        return FUSED_MOE_UNQUANTIZED_CONFIG
 
     # -------------------------------------------------------------- forward
     def apply(
@@ -280,12 +439,38 @@ class MiniMaxM3NvFp4MoEMethod(ModelOptMxFp8FusedMoE):
         shared_experts,
         shared_experts_input,
     ) -> torch.Tensor:
-        if self.hip_weights is not None and x.shape[0] <= self.hip_max_t:
+        T = x.shape[0]
+        if self.hip_weights is not None and T <= self.hip_max_t:
             from vllm.models.minimax_m3.amd.ops.nvfp4_moe_dec import (
                 nvfp4_moe_decode,
             )
 
             return nvfp4_moe_decode(self.hip_weights, x, topk_ids, topk_weights)
+        nv = self.nv_weights
+        if nv is not None:
+            mode = None
+            if T <= self.nv2_max_t:
+                if T > self.nv_min_t or not self.has_baseline:
+                    mode = "nv2"
+            elif self.nv_large in nv.modes:
+                mode = self.nv_large
+            if mode is not None:
+                from vllm.models.minimax_m3.amd.ops.nvfp4_moe_pf import nv_moe
+
+                return nv_moe(
+                    nv, mode, x, topk_weights, topk_ids, getattr(layer, "swiglu_limit", None)
+                )
+        if not self.has_baseline:
+            raise RuntimeError(
+                f"MiniMax-M3 NVFP4: no path for T={T} (baseline copy not built; "
+                "set VLLM_M3_NVFP4_MOE_KEEP_MXFP8=1)"
+            )
+        if self.base_weights is not None:
+            from vllm.models.minimax_m3.amd.ops.moe_baselines import baseline_moe
+
+            return baseline_moe(
+                self.base_weights, x, topk_weights, topk_ids, getattr(layer, "swiglu_limit", None)
+            )
         return super().apply(
             layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input
         )
