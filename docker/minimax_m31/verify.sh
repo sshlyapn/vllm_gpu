@@ -1,7 +1,8 @@
 #!/bin/bash
 # Compare the overlaid files and rebuilt JIT .so of an image against
 # reference_md5.txt (minimax-m3-mi355x:m31-v032-final-20261021 with the
-# fused_qknorm_idxrqknorm kernel from AITER c27755dfa).
+# fused_qknorm_idxrqknorm kernel from AITER c27755dfa and the routed-scale
+# change from vLLM 344365a252).
 # Needs no GPU. Exit status is non-zero on any mismatch.
 #
 # Usage: docker/minimax_m31/verify.sh <image>

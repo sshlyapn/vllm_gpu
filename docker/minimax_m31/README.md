@@ -19,7 +19,7 @@ AITER_REPO=$PWD/aiter vllm/docker/minimax_m31/build.sh minimax-m31:v032
 vllm/docker/minimax_m31/verify.sh minimax-m31:v032
 ```
 
-`verify.sh` prints `matches all 52 reference md5s` when the build is
+`verify.sh` prints `matches all 53 reference md5s` when the build is
 identical to the reference image.
 
 ## Notes

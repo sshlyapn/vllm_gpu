@@ -9,7 +9,7 @@
 # never reach the image.
 #
 # Usage: docker/minimax_m31/build.sh [image_tag]
-# Env (defaults reproduce minimax-m3-mi355x:m31-v032-final-20261021):
+# Env (defaults reproduce minimax-m3-mi355x:m31-v032-rscale-20261022):
 #   VLLM_REPO   vLLM git repo, local path or URL (default: this repo)
 #   VLLM_BASE   commit of the vllm package in BASE_IMAGE (v0.32.0)
 #   VLLM_REF    vLLM commit to install
@@ -26,7 +26,7 @@ VLLM_ROOT=$(git -C "$HERE" rev-parse --show-toplevel)
 
 VLLM_REPO=${VLLM_REPO:-$VLLM_ROOT}
 VLLM_BASE=${VLLM_BASE:-5df63a7203cdb9328d824a27b682e77c7b9928be}
-VLLM_REF=${VLLM_REF:-9d170f540586751a7f7a2f55ff06547ab47f6628}
+VLLM_REF=${VLLM_REF:-344365a2522852312a2396a49df0e5d5c4ab2026}
 AITER_REPO=${AITER_REPO:-$HOME/code/aiter}
 AITER_BASE=${AITER_BASE:-04896172e283ecc389f0dfff6479c3379ed63fa1}
 AITER_REF=${AITER_REF:-c27755dfa7f423723eb89c565b3d9aaeedf2e0de}
