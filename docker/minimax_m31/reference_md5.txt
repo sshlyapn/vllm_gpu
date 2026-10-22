@@ -36,7 +36,7 @@ OK ea0fc63a82b2aa490111e756b2ff2a2c aiter:csrc/kernels/sparse_attn/msa/pa_sparse
 OK 8823b3fe190cecdcd9c960f552938a99 aiter:csrc/pybind/moe_nvfp4_dec_pybind.cu
 OK faf2146365b31411dd8851ac4a11d388 aiter:aiter/__init__.py
 OK 3419bc97311f5a5ee8e2260957453f1c aiter:aiter/ops/fused_qknorm_idxrqknorm.py
-OK f969b7d9664d2aef572c97782b00113c aiter:csrc/kernels/fused_qknorm_idxrqknorm.cu
+OK 767b8d0ce17a6aaf920d508b20f40613 aiter:csrc/kernels/fused_qknorm_idxrqknorm.cu
 OK f1e7fccfe8d9be6145af3dd0b494a7f0 vllm:vllm/_aiter_ops.py
 OK e423281c7b6e7681b73ade753622c823 vllm:vllm/distributed/kv_transfer/kv_connector/v1/decode_bench_connector.py
 OK 93aadcddf4dc09ea9b8fe989b384145f vllm:vllm/model_executor/kernels/linear/mxfp8/rocm_native.py
@@ -46,7 +46,7 @@ OK 1f7ef73fd1f1781102682c6c284614c2 vllm:vllm/models/minimax_m3/amd/ops/moe_base
 OK ab8fa9c9f2b79880655932213fb952eb vllm:vllm/models/minimax_m3/amd/ops/sparse_pa.py
 OK c49740c280f88b92743e453a06927013 vllm:vllm/models/minimax_m3/amd/sparse_attention_msa.py
 OK 6a142e14ed20724072c8b5136a94cb2a vllm:vllm/models/minimax_m3/common/indexer.py
-SO da57102be8933b1a8fafb2d6ba4840cf module_fused_qknorm_idxrqknorm.so
+SO 233ee81ee808eff2a74e79f99ad366a6 module_fused_qknorm_idxrqknorm.so
 SO 771948aa4fd232af6961b50c225275c1 module_moe_nvfp4_dec.so
 SO 467c15e10bc43bb5e2261f75c44f2d6e module_msa_sparse_attention.so
 SO d647f7950834cc930c3488cc962df6ed module_moe_mxfp4_aux.so
