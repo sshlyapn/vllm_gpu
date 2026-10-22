@@ -1,0 +1,53 @@
+# MiniMax-M3.1 on MI355X (gfx950): the vLLM v0.32.0 ROCm release image plus the
+# M3.1 optimization commits of vLLM and AITER, installed as file overlays on top
+# of the packaged vllm 0.32.0 and aiter 0.1.24.post1 (no wheel rebuild). The
+# AITER JIT modules whose sources change are rebuilt for gfx950.
+#
+# Do not build this file directly: docker/minimax_m31/build.sh stages the
+# build context (overlay/) from the two git repos at pinned commits.
+ARG BASE_IMAGE=vllm/vllm-openai-rocm:v0.32.0
+FROM ${BASE_IMAGE}
+
+ARG SP=/usr/local/lib/python3.12/dist-packages
+ARG AITER_JIT_MODULES="module_fused_qknorm_idxrqknorm module_moe_nvfp4_dec module_msa_sparse_attention module_moe_mxfp4_aux"
+ARG GPU_ARCHS=gfx950
+
+COPY overlay /tmp/m31_overlay
+
+# overlay/vllm/vllm/** -> $SP/vllm, overlay/aiter/aiter/** -> $SP/aiter,
+# overlay/aiter/csrc/** -> $SP/aiter_meta/csrc (where aiter JIT reads sources).
+RUN set -eu; O=/tmp/m31_overlay; \
+    install_list() { \
+        while read -r f dst; do \
+            mkdir -p "$(dirname "$dst")"; cp "$O/$f" "$dst"; \
+            case "$dst" in *.py) \
+                d=$(dirname "$dst"); b=$(basename "$dst" .py); \
+                rm -f "$d/__pycache__/$b".*.pyc ;; \
+            esac; \
+            echo "installed $dst"; \
+        done; \
+    }; \
+    sed "s|^\(vllm/.*\)|vllm/\1 $SP/\1|" $O/vllm_files.txt | install_list; \
+    sed -e "s|^\(aiter/.*\)|aiter/\1 $SP/\1|" \
+        -e "s|^\(csrc/.*\)|aiter/\1 $SP/aiter_meta/\1|" $O/aiter_files.txt | install_list; \
+    sed "s|^|$SP/|" $O/vllm_deleted.txt | xargs -r rm -fv; \
+    sed -e "s|^aiter/|$SP/aiter/|" -e "s|^csrc/|$SP/aiter_meta/csrc/|" \
+        $O/aiter_deleted.txt | xargs -r rm -fv
+
+# No GPU during the build: importing aiter queries rocminfo, so put a stub that
+# reports GPU_ARCHS first on PATH for this step only.
+RUN set -eu; \
+    for m in $AITER_JIT_MODULES; do \
+        rm -f "$SP/aiter/jit/$m.so"; rm -rf "$SP/aiter/jit/build/$m"; \
+    done; \
+    mkdir -p /tmp/m31_bin; \
+    printf '#!/bin/sh\necho "  Name:                    %s"\n' "$GPU_ARCHS" \
+        > /tmp/m31_bin/rocminfo; \
+    chmod +x /tmp/m31_bin/rocminfo; \
+    cd /tmp && PATH=/tmp/m31_bin:$PATH GPU_ARCHS=$GPU_ARCHS \
+        python3 /tmp/m31_overlay/build_jit.py $AITER_JIT_MODULES; \
+    for m in $AITER_JIT_MODULES; do test -s "$SP/aiter/jit/$m.so"; done; \
+    rm -rf /tmp/aiter_configs /tmp/m31_overlay /tmp/m31_bin
+
+ENTRYPOINT ["/usr/bin/env"]
+CMD ["bash"]
